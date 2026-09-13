@@ -128,7 +128,7 @@ def get_active_tampered() -> np.ndarray | None:
 
 
 def sync_tampered_from_active_attack() -> np.ndarray | None:
-    """將目前攻擊設定所產生之 tampered 同步到 session_state，讓兩個流程共用同一份結果。"""
+    """將目前攻擊設定所產生之最新 tampered 同步到 session_state，讓雙流程共用最新結果。"""
     if st.session_state.embedded is None:
         return None
 
@@ -140,7 +140,35 @@ def sync_tampered_from_active_attack() -> np.ndarray | None:
     current_tampered = st.session_state.get("tampered")
     if current_tampered is None or not np.array_equal(to_display_uint8(current_tampered), active_u8):
         st.session_state.tampered = active_u8.copy()
+        st.session_state.recover_result = None
     return st.session_state.tampered
+
+
+def sync_attack_control(scope: str, attack_type: str, attack_ratio: int | None = None) -> bool:
+    """只由實際變更的 Tab 控制元件更新共享攻擊狀態。"""
+    type_seen_key = f"_{scope}_attack_type_seen"
+    ratio_seen_key = f"_{scope}_attack_ratio_seen"
+    type_changed = st.session_state.get(type_seen_key) != attack_type
+    ratio_changed = attack_ratio is not None and st.session_state.get(ratio_seen_key) != attack_ratio
+
+    st.session_state[type_seen_key] = attack_type
+    if attack_ratio is not None:
+        st.session_state[ratio_seen_key] = attack_ratio
+
+    state_changed = False
+    if type_changed and st.session_state.attack_type != attack_type:
+        st.session_state.attack_type = attack_type
+        state_changed = True
+    if ratio_changed and st.session_state.attack_ratio != attack_ratio:
+        st.session_state.attack_ratio = attack_ratio
+        state_changed = True
+
+    if state_changed:
+        st.session_state.tampered = None
+        st.session_state.recover_result = None
+        if attack_type != "custom_paint":
+            st.session_state.manual_tampered_cache = None
+    return state_changed
 
 
 def open_opencv_drawing_window(img_gray: np.ndarray) -> np.ndarray:
@@ -153,12 +181,10 @@ def open_opencv_drawing_window(img_gray: np.ndarray) -> np.ndarray:
     vis_base = cv2.cvtColor(to_display_uint8(img_gray), cv2.COLOR_GRAY2BGR)
     vis = vis_base.copy()
     
-    # 紀錄繪畫歷程以支援撤銷功能
     history = [vis.copy()]
-    
     drawing = False
     last_x, last_y = -1, -1
-    brush_thickness = 4  # 預設筆刷粗細
+    brush_thickness = 4
 
     def draw_callback(event, x, y, flags, param):
         nonlocal drawing, last_x, last_y, vis
@@ -172,7 +198,6 @@ def open_opencv_drawing_window(img_gray: np.ndarray) -> np.ndarray:
         elif event == cv2.EVENT_LBUTTONUP:
             if drawing:
                 drawing = False
-                # 紀錄當前筆畫完成後的狀態至歷史紀錄
                 history.append(vis.copy())
 
     window_name = "Manual Tamper (S: Save, Q: Quit, Z: Undo, Up/Down: Brush Size)"
@@ -180,25 +205,22 @@ def open_opencv_drawing_window(img_gray: np.ndarray) -> np.ndarray:
     cv2.setMouseCallback(window_name, draw_callback)
 
     while True:
-        # 在視窗左上角即時顯示目前筆刷粗細提示
         display_frame = vis.copy()
-               
         cv2.imshow(window_name, display_frame)
         key = cv2.waitKey(1) & 0xFF
         
         if key in (ord('s'), ord('S')):
             break
         elif key in (ord('q'), ord('Q'), 27):
-            # 若按 Q 則回復最初原圖
             vis = vis_base.copy()
             break
-        elif key in (ord('z'), ord('Z'), 8): # Z 鍵或 Backspace 撤銷
+        elif key in (ord('z'), ord('Z'), 8):
             if len(history) > 1:
-                history.pop() # 移除最新一筆
-                vis = history[-1].copy() # 回復到上一筆狀態
-        elif key == 82 or key == 0: # 某些系統的上方向鍵
+                history.pop()
+                vis = history[-1].copy()
+        elif key == 82 or key == 0:
             brush_thickness = min(40, brush_thickness + 2)
-        elif key == 84 or key == 1: # 某些系統的下方向鍵
+        elif key == 84 or key == 1:
             brush_thickness = max(2, brush_thickness - 2)
 
     cv2.destroyAllWindows()
@@ -344,7 +366,6 @@ def execute_tamper_and_recover():
     try:
         model, device = cached_model()
 
-        # 1. 確保有含浮水印影像
         if st.session_state.embedded is None:
             er = embed_watermark(
                 st.session_state.original,
@@ -356,42 +377,12 @@ def execute_tamper_and_recover():
             st.session_state.embed_result = er
             st.session_state.embedded = er.embedded
 
-        host_u8 = to_display_uint8(st.session_state.embedded)
-        attack_type = st.session_state.attack_type
-        ratio = st.session_state.attack_ratio
+        new_tampered = get_active_tampered()
+        if new_tampered is None:
+            new_tampered = to_display_uint8(st.session_state.embedded)
 
-        # 2. 根據攻擊類型產生最新竄改圖
-        if attack_type == "custom_paint":
-            if st.session_state.manual_tampered_cache is not None:
-                new_tampered = st.session_state.manual_tampered_cache.copy()
-            else:
-                new_tampered = host_u8.copy()
-        elif attack_type == "deletion":
-            new_tampered, _, _, _ = deletion_attack(host_u8, ratio)
-        elif attack_type == "copy_paste":
-            new_tampered, _, _ = collage_attack(host_u8, int(ratio))
-        elif attack_type == "collage":
-            src_c = (
-                st.session_state.collage_source_embedded
-                if st.session_state.collage_source_embedded is not None
-                else st.session_state.collage_source_orig
-            )
-            if src_c is None:
-                load_different_collage_default_image()
-                src_c = st.session_state.collage_source_embedded
-            src_u8 = to_display_uint8(src_c)
-            if src_u8.shape != host_u8.shape:
-                src_u8 = cv2.resize(src_u8, (host_u8.shape[1], host_u8.shape[0]))
-            new_tampered, _, _ = ca_attack(host_u8, src_u8, int(ratio), side="right")
-        elif attack_type == "none":
-            new_tampered = host_u8.copy()
-        else:
-            new_tampered = apply_attack(st.session_state.embedded, attack_type, ratio)
-
-        # 3. 全域同步更新 tampered
         st.session_state.tampered = to_display_uint8(new_tampered)
 
-        # 4. 執行修復模型推論
         rr = recover_watermark(
             st.session_state.tampered,
             model,
@@ -493,11 +484,9 @@ def sync_watermark_embed(prev_orig):
 
 
 def render_dual_action_controls(scope="tab1"):
-    # 若尚未載入圖片，先預設自動載入一張系統影像
     if st.session_state.original is None:
         load_system_default_image()
 
-    # 左右兩欄：左側放 380×380 影像，右側放按鈕
     col_img, col_btns = st.columns([1, 1])
 
     with col_img:
@@ -512,7 +501,6 @@ def render_dual_action_controls(scope="tab1"):
     with col_btns:
         st.markdown("<div style='height: 40px;'></div>", unsafe_allow_html=True)
 
-        # 1. 使用預設影像按鈕（點擊直接切換/隨機抽換系統預設圖）
         if st.button("🔄 使用預設影像", key=f"{scope}_btn_use_default", use_container_width=True):
             load_system_default_image()
             st.session_state.embedded = None
@@ -524,14 +512,12 @@ def render_dual_action_controls(scope="tab1"):
 
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
-        # 2. 更換照片按鈕（位於影像右方，點擊展開本機上傳框）
         if st.button("📁 上傳影像", key=f"{scope}_btn_change_photo", use_container_width=True):
             st.session_state.show_upload_dialog_scope = (
                 None if st.session_state.show_upload_dialog_scope == scope else scope
             )
             st.rerun()
 
-        # 展開的上傳檔案選單
         if st.session_state.show_upload_dialog_scope == scope:
             st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
             uploaded_file = st.file_uploader(
@@ -550,7 +536,6 @@ def render_dual_action_controls(scope="tab1"):
                 st.session_state.show_upload_dialog_scope = None
                 st.rerun()
 
-# 建立英文 key 對應的中文顯示名稱
 attack_name_zh_map = {
     "custom_paint": "自訂塗鴉",
     "doodle": "局部塗鴉",
@@ -605,6 +590,8 @@ with tab_overall:
         attack_type = st.selectbox(
             "選擇破壞行為",
             ["custom_paint", "doodle", "copy_paste", "collage", "deletion", "none"],
+            index=["custom_paint", "doodle", "copy_paste", "collage", "deletion", "none"].index(st.session_state.attack_type)
+            if st.session_state.attack_type in ["custom_paint", "doodle", "copy_paste", "collage", "deletion", "none"] else 0,
             format_func=lambda x: {
                 "custom_paint": "🎨 自訂塗鴉竄改（彈出視窗手動繪畫）",
                 "doodle": "局部塗鴉遮蔽（由上而下塗黑）",
@@ -615,11 +602,9 @@ with tab_overall:
             }[x],
             key="tab1_attack_select",
         )
-        st.session_state.attack_type = attack_type
-
-        if prev_attack_type != attack_type:
-            st.session_state.tampered = None
-            st.session_state.recover_result = None
+        attack_control_changed = sync_attack_control("tab1", attack_type)
+        if attack_control_changed:
+            st.rerun()
 
         if attack_type == "collage" and st.session_state.collage_source_embedded is None:
             load_different_collage_default_image()
@@ -640,11 +625,12 @@ with tab_overall:
                     "竄改面積比例 (%)",
                     10,
                     90,
-                    50,
+                    st.session_state.attack_ratio,
                     5,
                     key="tab1_attack_ratio",
                 )
-                st.session_state.attack_ratio = attack_ratio
+                if sync_attack_control("tab1", attack_type, attack_ratio):
+                    st.rerun()
             else:
                 st.info("已設定為「不破壞」，右側展示保護圖。")
 
@@ -690,39 +676,12 @@ with tab_overall:
         st.markdown("##### 🖼️ 竄改影像顯示區")
 
         if st.session_state.embedded is not None:
-            if attack_type == "custom_paint":
-                if st.session_state.manual_tampered_cache is not None:
-                    sim_tampered = st.session_state.manual_tampered_cache
-                else:
-                    sim_tampered = st.session_state.embedded.copy()
-            else:
-                host_u8 = to_display_uint8(st.session_state.embedded)
-                if attack_type == "deletion":
-                    sim_tampered, _, _, _ = deletion_attack(host_u8, st.session_state.attack_ratio)
-                elif attack_type == "copy_paste":
-                    sim_tampered, _, _ = collage_attack(host_u8, int(st.session_state.attack_ratio))
-                elif attack_type == "collage":
-                    src_c = (
-                        st.session_state.collage_source_embedded 
-                        if st.session_state.collage_source_embedded is not None 
-                        else st.session_state.collage_source_orig
-                    )
-                    if src_c is None:
-                        load_different_collage_default_image()
-                        src_c = st.session_state.collage_source_embedded
-                    src_u8 = to_display_uint8(src_c)
-                    if src_u8.shape != host_u8.shape:
-                        src_u8 = cv2.resize(src_u8, (host_u8.shape[1], host_u8.shape[0]))
-                    sim_tampered, _, _ = ca_attack(host_u8, src_u8, int(st.session_state.attack_ratio), side="right")
-                else:
-                    sim_tampered = apply_attack(
-                        st.session_state.embedded,
-                        attack_type,
-                        st.session_state.attack_ratio,
-                    )
-            st.session_state.tampered = sim_tampered
+            sim_tampered = sync_tampered_from_active_attack()
+            if sim_tampered is None:
+                sim_tampered = st.session_state.embedded.copy()
             sim_tampered_380 = cv2.resize(to_display_uint8(sim_tampered), (380, 380), interpolation=cv2.INTER_NEAREST)
-            st.image(to_rgb(sim_tampered_380), caption=f"已套用攻擊：{attack_type_zh}", width=380)
+            current_attack_type_zh = attack_name_zh_map.get(st.session_state.attack_type, st.session_state.attack_type)
+            st.image(to_rgb(sim_tampered_380), caption=f"已套用攻擊：{current_attack_type_zh}", width=380)
         else:
             st.warning("請先載入影像。")
 
@@ -814,7 +773,6 @@ with tab_overall:
                 display: block;
             }}
             
-            /* 標題固定高度與統一樣式 */
             .card-title {{
                 font-size: 14px;
                 font-weight: 700;
@@ -833,8 +791,6 @@ with tab_overall:
                 min-height: 30px;
             }}
 
-
-            /* 統一數據方框高度，並以 flex 置中對齊內容 */
             .metrics-box {{
                 margin-top: 10px;
                 padding: 8px 10px;
@@ -989,13 +945,8 @@ with tab_detail:
     # ---------------------------------------------------------------------
     if cur_step == "導入影像":
         st.markdown("## 導入影像")
-
         prev_orig_tab2 = st.session_state.original
-
-        # 直接調用封裝好的控制組件，傳入 scope="tab2"
         render_dual_action_controls(scope="tab2")
-
-        # 同步生成浮水印
         sync_watermark_embed(prev_orig_tab2)
 
     # ---------------------------------------------------------------------
@@ -1449,311 +1400,155 @@ with tab_detail:
     # 節點 3：模擬攻擊
     # ---------------------------------------------------------------------
     elif cur_step == "模擬攻擊":
-        st.markdown("## 選擇模擬攻擊")
-
-        if st.session_state.original is None:
-            load_system_default_image()
-
-        if st.session_state.embedded is None and st.session_state.original is not None:
-            model_auto, dev_auto = cached_model()
-            er_init = embed_watermark(st.session_state.original, model_auto, dev_auto, seed=st.session_state.seed, demo_block_id=0)
-            st.session_state.embed_result = er_init
-            st.session_state.embedded = er_init.embedded
-
-        attack_descriptions = {
-            "custom_paint": """
-            <b>自訂塗鴉竄改 (Custom Paint Attack)：</b><br><br>
-            點擊下方按鈕可彈出獨立視窗進行手動滑鼠繪畫塗鴉。<br>
-            繪畫完畢後按 S 鍵儲存確認，系統將立即鎖定受損狀態並進行自癒比對。
-            """,
-            "doodle": """
-            <b>局部塗鴉遮蔽 (Doodle Attack)：</b><br><br>
-            模擬大面積連續色塊遮蔽，遮蔽區的 2LSB 浮水印特徵將直接被常數抹除。<br>
-            解密端將藉由未受損區塊之特徵，透過 Decoder 生成補全。
-            """,
-            "copy_paste": """
-            <b>區塊複製貼上攻擊 (Copy-Paste Attack)：</b><br><br>
-            僅使用<b>原始影像</b>本身，將影像內部之 16×16 區塊進行平移錯位拼貼。<br>
-            浮水印雖然存在於本圖，但由於空間座標發生位移，會觸發解密端金鑰驗證錯誤。
-            """,
-            "collage": """
-            <b>拼貼攻擊 (Collage Attack)：</b><br><br>
-            必須使用<b>兩張影像</b>（目前受保護圖 + 另一張注入浮水印之防偽影像）。<br>
-            系統會將另一張影像的大區塊（如右半部）覆蓋到本圖上，模擬跨圖片偽造拼接。
-            """,
-            "deletion": """
-            <b>中心區塊挖空 (Deletion / Inpainting Attack)：</b><br><br>
-            模擬圖片核心主體遭到抹除並以白色區塊填補。<br>
-            用以驗證大範圍主體缺失下的特徵重構自癒能力。
-            """,
-            "none": """
-            <b>不破壞（完整性驗證）：</b><br><br>
-            不施加任何攻擊行為，直接送入偵測網絡，基準竄改率應為 0%。
-            """,
-        }
-
-        st.markdown(
-            """
-            <style>
-            .attack-select-dropdown div[data-baseweb="select"] > div {
-                background-color: #f1f5f9 !important;
-                border-radius: 12px !important;
-                border: 1.5px solid #94a3b8 !important;
-                color: #0f172a !important;
-                font-weight: 600 !important;
-                font-size: 15px !important;
-                padding: 4px 10px !important;
-            }
-            .attack-run-btn div[data-testid="stButton"] button {
-                background-color: #1d4ed8 !important;
-                color: #ffffff !important;
-                border: none !important;
-                border-radius: 10px !important;
-                font-size: 16px !important;
-                font-weight: 700 !important;
-                padding: 12px 24px !important;
-                box-shadow: 0 4px 10px rgba(29, 78, 216, 0.25) !important;
-                transition: all 0.15s ease !important;
-            }
-            .attack-run-btn div[data-testid="stButton"] button:hover {
-                background-color: #1e40af !important;
-                transform: scale(1.02) !important;
-            }
-            .attack-display-frame {
-                width: 320px;
-                height: 320px;
-                border: 2px solid #111827;
-                background-color: #000000;
-                overflow: hidden;
-                box-sizing: border-box;
-                border-radius: 6px;
-                margin: 0 auto;
-            }
-            .attack-display-frame img {
-                width: 100%;
-                height: 100%;
-                object-fit: fill;
-                display: block;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        col_attack_left, col_attack_mid, col_attack_right = st.columns([1.1, 1.2, 1.4])
-
-        with col_attack_left:
-            st.markdown("##### 破壞模式選擇")
-            st.markdown('<div class="attack-select-dropdown">', unsafe_allow_html=True)
-            
-            attack_keys = ["custom_paint", "doodle", "copy_paste", "collage", "deletion", "none"]
-            sel_attack = st.selectbox(
-                "下拉式選單",
-                attack_keys,
-                index=attack_keys.index(st.session_state.attack_type) if st.session_state.attack_type in attack_keys else 0,
+            st.markdown("##### 🛠️ 攻擊方式")
+    
+            prev_attack_type = st.session_state.attack_type
+            attack_type = st.selectbox(
+                "選擇破壞行為",
+                ["custom_paint", "doodle", "copy_paste", "collage", "deletion", "none"],
+                index=["custom_paint", "doodle", "copy_paste", "collage", "deletion", "none"].index(st.session_state.attack_type)
+                if st.session_state.attack_type in ["custom_paint", "doodle", "copy_paste", "collage", "deletion", "none"] else 0,
                 format_func=lambda x: {
-                    "custom_paint": "🎨 自訂塗鴉竄改 (彈出視窗繪畫)",
-                    "doodle": "局部塗鴉遮蔽 (Doodle)",
-                    "copy_paste": "區塊複製貼上攻擊 (僅原圖)",
-                    "collage": "拼貼攻擊 (需使用 2 張影像)",
-                    "deletion": "中心區塊挖空 (Deletion)",
-                    "none": "不破壞 (None)",
+                    "custom_paint": "🎨 自訂塗鴉竄改（彈出視窗手動繪畫）",
+                    "doodle": "局部塗鴉遮蔽（由上而下塗黑）",
+                    "copy_paste": "區塊複製貼上攻擊（僅原圖內部平移）",
+                    "collage": "拼貼攻擊（使用 2 張影像大區塊置換）",
+                    "deletion": "中心區塊挖空（刪除填白）",
+                    "none": "不破壞（純驗證完整性）",
                 }[x],
-                key="detail_attack_picker",
+                key="tab2_attack_select",
             )
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            if sel_attack != st.session_state.attack_type:
-                st.session_state.attack_type = sel_attack
-                st.session_state.tampered = None
-                st.session_state.recover_result = None
-
-            if sel_attack == "collage" and st.session_state.collage_source_embedded is None:
+            attack_control_changed = sync_attack_control("tab2", attack_type)
+            if attack_control_changed:
+                st.rerun()
+    
+            if attack_type == "collage" and st.session_state.collage_source_embedded is None:
                 load_different_collage_default_image()
-
-            st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
-
-            if sel_attack == "custom_paint":
-                st.markdown("##### 手動繪畫控制")
-                if st.button("🎨 開啟繪畫視窗", use_container_width=True, key="btn_open_cv_paint_tab2"):
+    
+            if attack_type == "custom_paint":
+                st.caption("點擊下方按鈕將彈出獨立視窗，用滑鼠繪畫，按 S 鍵儲存確認、按 Q 鍵離開。")
+                if st.button("🎨 開啟繪畫視窗進行手動塗鴉", use_container_width=True, key="btn_open_cv_paint_tab2"):
                     if st.session_state.embedded is not None:
                         res_draw = open_opencv_drawing_window(st.session_state.embedded)
                         st.session_state.manual_tampered_cache = res_draw
                         st.session_state.tampered = res_draw
-                        st.success("手動塗鴉已更新！")
+                        st.success("手動塗鴉已儲存！")
                     else:
-                        st.error("請先載入影像！")
-            elif sel_attack != "none":
-                st.markdown("##### 調整竄改率")
-                detail_attack_ratio = st.slider(
-                    "調整竄改率橫條",
-                    10,
-                    90,
-                    st.session_state.attack_ratio,
-                    5,
-                    key="detail_attack_slider",
-                )
-                st.session_state.attack_ratio = detail_attack_ratio
+                        st.error("請先載入並嵌入浮水印影像！")
+
+
+
             else:
-                st.caption("目前模式為「不破壞」，竄改率為 0%")
-
-        with col_attack_mid:
-            st.markdown("##### 關於攻擊的描述...")
-            desc_text = attack_descriptions.get(sel_attack, "")
-            st.markdown(
-                f"""
-                <div style="font-size: 13.5px; line-height: 1.6; color: #374151; background: #f9fafb; padding: 16px; border-radius: 10px; border: 1.5px solid #e2e8f0;">
-                    {desc_text}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        if sel_attack == "collage":
-            st.divider()
-            st.markdown("##### 🧩 拼貼來源影像設定 (此攻擊需要 2 張影像)")
-            
-            c_src_ctrl, c_src_view1, c_src_view2 = st.columns([1.2, 1, 1])
-            with c_src_ctrl:
-                uploaded_src = st.file_uploader(
-                    "上傳另一張拼貼影像 (PNG/JPG)", 
-                    type=["png", "jpg", "jpeg"], 
-                    key=f"upload_collage_{st.session_state.tab2_collage_uploader_key}"
-                )
-                if uploaded_src is not None:
-                    file_b = np.frombuffer(uploaded_src.read(), np.uint8)
-                    dec_img = cv2.imdecode(file_b, cv2.IMREAD_GRAYSCALE)
-                    st.session_state.collage_source_orig = load_gray_image_from_array_or_path(dec_img)
-                    model_auto, dev_auto = cached_model()
-                    er_src = embed_watermark(st.session_state.collage_source_orig, model_auto, dev_auto, seed=st.session_state.seed, demo_block_id=0)
-                    st.session_state.collage_source_embedded = er_src.embedded
-                    st.session_state.tab2_collage_uploader_key += 1
-                    st.rerun()
-
-                st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
-                if st.button("🔄 隨機使用其他預設拼貼影像", key="btn_switch_collage_default", use_container_width=True):
-                    load_different_collage_default_image()
-                    st.rerun()
-
-            with c_src_view1:
+                if attack_type != "none":
+                    attack_ratio = st.slider(
+                        "竄改面積比例 (%)",
+                        10,
+                        90,
+                        st.session_state.attack_ratio,
+                        5,
+                        key="tab2_attack_ratio",
+                    )
+                    if sync_attack_control("tab2", attack_type, attack_ratio):
+                        st.rerun()
+                else:
+                    st.info("已設定為「不破壞」，右側展示保護圖。")
+    
+            if attack_type == "collage":
+                st.markdown("<div style='margin-top: 10px; padding: 12px; background: #f8fafc; border: 1.5px solid #cbd5e1; border-radius: 8px;'>", unsafe_allow_html=True)
+                st.markdown("<b>🧩 拼貼攻擊來源設定 (使用第 2 張影像)</b>", unsafe_allow_html=True)
+                
+                c_t1_up, c_t1_def = st.columns([1.2, 1])
+                with c_t1_up:
+                    up_src_tab2 = st.file_uploader(
+                        "上傳拼貼來源圖",
+                        type=["png", "jpg", "jpeg"],
+                        key=f"tab2_collage_up_{st.session_state.tab2_collage_uploader_key}",
+                    )
+                    if up_src_tab2 is not None:
+                        file_b = np.frombuffer(up_src_tab2.read(), np.uint8)
+                        dec_img = cv2.imdecode(file_b, cv2.IMREAD_GRAYSCALE)
+                        st.session_state.collage_source_orig = load_gray_image_from_array_or_path(dec_img)
+                        model_auto, dev_auto = cached_model()
+                        er_src = embed_watermark(st.session_state.collage_source_orig, model_auto, dev_auto, seed=st.session_state.seed, demo_block_id=0)
+                        st.session_state.collage_source_embedded = er_src.embedded
+                        st.session_state.tab2_collage_uploader_key += 1
+                        st.rerun()
+    
+                with c_t1_def:
+                    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                    if st.button("🔄 隨機切換其他預設拼貼圖", key="tab2_btn_collage_rand", use_container_width=True):
+                        load_different_collage_default_image()
+                        st.rerun()
+    
                 if st.session_state.collage_source_orig is not None:
-                    st.image(to_rgb(st.session_state.collage_source_orig), caption="第二張拼貼原圖", width=150)
-                else:
-                    st.info("尚未載入拼貼原圖")
+                    c_p1, c_p2 = st.columns(2)
+                    with c_p1:
+                        st.image(to_rgb(st.session_state.collage_source_orig), caption="第二張拼貼原始影像", width=130)
+                    with c_p2:
+                        st.image(to_rgb(st.session_state.collage_source_embedded), caption="含浮水印影像", width=130)
+                st.markdown("</div>", unsafe_allow_html=True)
+    
+            if st.button(
+                "✅ 完成竄改",
+                type="primary",
+                use_container_width=True,
+                key="tab2_start_btn",
+            ):
+                with st.spinner("系統正在比對破損區域並進行修復..."):
+                    success = execute_tamper_and_recover()
 
-            with c_src_view2:
-                if st.session_state.collage_source_embedded is not None:
-                    st.image(to_rgb(st.session_state.collage_source_embedded), caption="已注入浮水印之防偽圖", width=150)
-                else:
-                    st.warning("等待產生防偽浮水印...")
-
-        with col_attack_right:
-            st.markdown("##### 攻擊預覽區")
-            if sel_attack == "custom_paint":
-                if st.session_state.manual_tampered_cache is not None:
-                    sim_display = st.session_state.manual_tampered_cache
-                else:
-                    sim_display = st.session_state.embedded.copy()
-            else:
-                try:
-                    host_uint8 = to_display_uint8(st.session_state.embedded)
-                    if sel_attack == "deletion":
-                        sim_display, _, _, _ = deletion_attack(host_uint8, st.session_state.attack_ratio)
-                    elif sel_attack == "copy_paste":
-                        sim_display, _, _ = collage_attack(host_uint8, int(st.session_state.attack_ratio))
-                    elif sel_attack == "collage":
-                        src_candidate = (
-                            st.session_state.collage_source_embedded 
-                            if st.session_state.collage_source_embedded is not None 
-                            else st.session_state.collage_source_orig
-                        )
-                        if src_candidate is None:
-                            load_different_collage_default_image()
-                            src_candidate = st.session_state.collage_source_embedded
-                        src_uint8 = to_display_uint8(src_candidate)
-                        if src_uint8.shape != host_uint8.shape:
-                            src_uint8 = cv2.resize(src_uint8, (host_uint8.shape[1], host_uint8.shape[0]))
-                        sim_display, _, _ = ca_attack(host_uint8, src_uint8, int(st.session_state.attack_ratio), side="right")
-                    else:
-                        sim_display = apply_attack(
-                            st.session_state.embedded,
-                            sel_attack,
-                            st.session_state.attack_ratio,
-                        )
-                except Exception as e:
-                    sim_display = st.session_state.embedded.copy()
-
-            img_b64 = image_to_base64(sim_display)
-            st.markdown(
-                f"""
-                <div class="attack-display-frame">
-                    <img src="data:image/png;base64,{img_b64}" />
-                </div>
-                <div style="text-align: center; font-size: 13px; font-weight: 600; color: #4b5563; margin-top: 6px;">
-                    破壞預覽
-                </div>
-                """,
-                unsafe_allow_html=True,
+                if success:
+                    st.success("🎉 已同步更新整體流程與詳細流程結果！")
+                    st.rerun()
+        
+            st.markdown("##### 🖼️ 竄改影像顯示區")
+    
+            sim_tampered = sync_tampered_from_active_attack()
+            if sim_tampered is None:
+                sim_tampered = st.session_state.embedded.copy()
+            sim_tampered_380 = cv2.resize(
+                to_display_uint8(sim_tampered),
+                (380, 380),
+                interpolation=cv2.INTER_NEAREST,
             )
 
-            st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
-            
-            can_submit = True
-            if sel_attack == "collage" and st.session_state.collage_source_embedded is None:
-                can_submit = False
+            current_attack_type_zh = attack_name_zh_map.get(st.session_state.attack_type, st.session_state.attack_type)
+            st.image(
+                to_rgb(sim_tampered_380),
+                caption=f"已套用攻擊：{current_attack_type_zh}",
+                width=380,
+            )
 
-            st.markdown('<div class="attack-run-btn">', unsafe_allow_html=True)
-            if st.button("✅ 完成竄改", key="btn_run_detail_attack", disabled=not can_submit, use_container_width=True):
-                with st.spinner("系統正在強制更新竄改圖並執行解密與自癒修復..."):
-                    success = execute_tamper_and_recover()
-                if success:
-                    # 完成後直接導航至下一步「偵測竄改區域」
-                    st.session_state.detail_step = "偵測竄改區域"
-                    st.rerun()
-
-    # ---------------------------------------------------------------------
-    # 節點 4：偵測竄改區域
-    # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------
     # 節點 4：偵測竄改區域
     # ---------------------------------------------------------------------
     elif cur_step == "偵測竄改區域":
+        
         st.markdown("### 🔹 偵測竄改區域 (解密、投票與節點導覽)")
 
-        if st.session_state.original is None:
-            load_system_default_image()
+        # 先同步目前攻擊產生的最新竄改圖
+        sim_tampered = sync_tampered_from_active_attack()
 
-        if st.session_state.embedded is None and st.session_state.original is not None:
-            model_auto, dev_auto = cached_model()
-            er_auto = embed_watermark(
-                st.session_state.original, model_auto, dev_auto, seed=st.session_state.seed, demo_block_id=0
+        # 每次進入此步驟，都重新用最新竄改圖重新偵測
+        if (
+            sim_tampered is not None
+            and st.session_state.embedded is not None
+        ):
+            model, device = cached_model()
+
+            st.session_state.recover_result = recover_watermark(
+                sim_tampered,
+                model,
+                device,
+                seed=st.session_state.seed,
             )
-            st.session_state.embed_result = er_auto
-            st.session_state.embedded = er_auto.embedded
-
-        # ⚠️ 1. 確保 tampered 存在：若尚未產生過竄改圖，才執行一次主動同步
-        if st.session_state.tampered is None:
-            st.session_state.tampered = get_active_tampered()
-
-        # ⚠️ 2. 確保 recover_result 與當前的 tampered 完全同步
-        if st.session_state.tampered is not None:
-            if (st.session_state.recover_result is None or 
-                not np.array_equal(to_display_uint8(st.session_state.recover_result.tampered), to_display_uint8(st.session_state.tampered))):
-                model_auto, dev_auto = cached_model()
-                st.session_state.recover_result = recover_watermark(
-                    st.session_state.tampered,
-                    model_auto,
-                    dev_auto,
-                    seed=st.session_state.seed,
-                )
 
         rr = st.session_state.recover_result
 
-        if rr is None:
+        if rr is None or sim_tampered is None:
             st.warning("無法載入解密與修復資料，請確認輸入影像狀態。")
         else:
-            # 確保提取演算法直接採用當前最新的 session_state.tampered
-            display_tampered_img = to_display_uint8(st.session_state.tampered)
+            display_tampered_img = to_display_uint8(sim_tampered)
             tampering_image = load_gray_image_from_array_or_path(display_tampered_img)
             disruption_op = upset_ofKey.Disruption_operation()
             extract_module = extract_bn256.extractImage_To_Bottleneck()
@@ -2210,7 +2005,7 @@ with tab_detail:
                 }});
 
                 if (decCells.length > 0) {{
-                    selectAndLockBlock(0, decCells[0]);
+                    selectAndLockDecBlock(0, decCells[0]);
                 }}
             </script>
             """
@@ -2608,8 +2403,7 @@ with tab_detail:
             st.session_state.embed_result = er_auto
             st.session_state.embedded = er_auto.embedded
 
-        if st.session_state.tampered is None and st.session_state.embedded is not None:
-            st.session_state.tampered = st.session_state.embedded.copy()
+        sync_tampered_from_active_attack()
 
         if st.session_state.tampered is not None:
             if (st.session_state.recover_result is None or 
@@ -2771,7 +2565,7 @@ with tab_detail:
                                 <div class="stage-card-title">1. 接收影像 (竄改圖)</div>
                                 <div style="font-size: 12px; color: #0f172a; font-weight: 600; margin-top: 4px; line-height: 1.4;">
                                     <div>竄改率: <span style="color: #2563eb; font-weight: 700;">{tamper_ratio_pct:.2f}%</span></div>
-                                    <div style="color: #64748b; font-size: 11px;">模式: {st.session_state.attack_type_zh}</div>
+                                    <div style="color: #64748b; font-size: 11px;">模式: {attack_type_zh}</div>
                                 </div>
                             </div>
                         </div>
