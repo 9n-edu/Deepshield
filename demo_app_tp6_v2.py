@@ -950,9 +950,9 @@ with tab_detail:
         sync_watermark_embed(prev_orig_tab2)
 
     # ---------------------------------------------------------------------
-    # 節點 2：嵌入浮水印
+    # 節點 2：製作並嵌入浮水印
     # ---------------------------------------------------------------------
-    elif cur_step == "嵌入浮水印":
+    elif cur_step == "製作並嵌入浮水印":
         st.markdown("### 🔹 嵌入浮水印 (加密混淆並以2LSB方式嵌入影像中)")
         st.caption("點擊左方 4×4 區塊選取，隨後可在右方放大畫布中檢視數值、執行 XOR 混淆或拖曳橫條進行 Arnold Transform 置換：")
 
@@ -2390,305 +2390,356 @@ with tab_detail:
     # 節點 5：修復影像
     # ---------------------------------------------------------------------
     elif cur_step == "修復影像":
-        st.markdown("### 🔹 修復影像 (可信任解碼重建與動態掃描還原)")
+    st.markdown("### 🔹 修復影像 (可信任解碼重建與動態掃描還原)")
 
-        if st.session_state.original is None:
-            load_system_default_image()
+    if st.session_state.original is None:
+        load_system_default_image()
 
-        if st.session_state.embedded is None and st.session_state.original is not None:
+    if st.session_state.embedded is None and st.session_state.original is not None:
+        model_auto, dev_auto = cached_model()
+        er_auto = embed_watermark(
+            st.session_state.original, model_auto, dev_auto, seed=st.session_state.seed, demo_block_id=0
+        )
+        st.session_state.embed_result = er_auto
+        st.session_state.embedded = er_auto.embedded
+
+    sync_tampered_from_active_attack()
+
+    if st.session_state.tampered is not None:
+        if (st.session_state.recover_result is None or 
+            not np.array_equal(st.session_state.recover_result.tampered, st.session_state.tampered)):
             model_auto, dev_auto = cached_model()
-            er_auto = embed_watermark(
-                st.session_state.original, model_auto, dev_auto, seed=st.session_state.seed, demo_block_id=0
+            st.session_state.recover_result = recover_watermark(
+                st.session_state.tampered,
+                model_auto,
+                dev_auto,
+                seed=st.session_state.seed,
             )
-            st.session_state.embed_result = er_auto
-            st.session_state.embedded = er_auto.embedded
 
-        sync_tampered_from_active_attack()
+    rr = st.session_state.recover_result
 
-        if st.session_state.tampered is not None:
-            if (st.session_state.recover_result is None or 
-                not np.array_equal(st.session_state.recover_result.tampered, st.session_state.tampered)):
-                model_auto, dev_auto = cached_model()
-                st.session_state.recover_result = recover_watermark(
-                    st.session_state.tampered,
-                    model_auto,
-                    dev_auto,
-                    seed=st.session_state.seed,
-                )
+    if rr is None:
+        st.warning("無法載入修復結果，請確認影像狀態。")
+    else:
+        p_tampered, s_tampered = calculate_correct_psnr_ssim(st.session_state.original, rr.tampered)
+        p_rec, s_rec = calculate_correct_psnr_ssim(st.session_state.original, rr.recovered)
+        p_recon, s_recon = calculate_correct_psnr_ssim(st.session_state.original, rr.bottleneck_recon)
 
-        rr = st.session_state.recover_result
+        emb_check_3 = to_display_uint8(st.session_state.embedded)
+        tam_check_3 = to_display_uint8(st.session_state.tampered)
+        if emb_check_3.ndim == 3:
+            emb_check_3 = cv2.cvtColor(emb_check_3, cv2.COLOR_RGB2GRAY)
+        if tam_check_3.ndim == 3:
+            tam_check_3 = cv2.cvtColor(tam_check_3, cv2.COLOR_RGB2GRAY)
+        diff_cnt_3 = int(np.sum(emb_check_3 != tam_check_3))
+        total_cnt_3 = int(emb_check_3.size)
+        tamper_ratio_pct = float(diff_cnt_3 / total_cnt_3) * 100.0 if total_cnt_3 > 0 else 0.0
 
-        if rr is None:
-            st.warning("無法載入修復結果，請確認影像狀態。")
+        if st.session_state.embedded is not None:
+            rec_val, prec_val, f1_val = compute_detection_metrics(
+                st.session_state.embedded,
+                st.session_state.tampered,
+                rr.detection_mask
+            )
         else:
-            p_tampered, s_tampered = calculate_correct_psnr_ssim(st.session_state.original, rr.tampered)
-            p_rec, s_rec = calculate_correct_psnr_ssim(st.session_state.original, rr.recovered)
-            p_recon, s_recon = calculate_correct_psnr_ssim(st.session_state.original, rr.bottleneck_recon)
+            rec_val, prec_val, f1_val = 0.0, 0.0, 0.0
 
-            emb_check_3 = to_display_uint8(st.session_state.embedded)
-            tam_check_3 = to_display_uint8(st.session_state.tampered)
-            if emb_check_3.ndim == 3:
-                emb_check_3 = cv2.cvtColor(emb_check_3, cv2.COLOR_RGB2GRAY)
-            if tam_check_3.ndim == 3:
-                tam_check_3 = cv2.cvtColor(tam_check_3, cv2.COLOR_RGB2GRAY)
-            diff_cnt_3 = int(np.sum(emb_check_3 != tam_check_3))
-            total_cnt_3 = int(emb_check_3.size)
-            tamper_ratio_pct = float(diff_cnt_3 / total_cnt_3) * 100.0 if total_cnt_3 > 0 else 0.0
+        # 產生綠色遮罩（正常保留區）與紅色遮罩（重建修補區）視覺圖
+        orig_disp = to_display_uint8(st.session_state.tampered)
+        orig_disp_rgb = cv2.cvtColor(orig_disp, cv2.COLOR_GRAY2RGB) if orig_disp.ndim == 2 else orig_disp.copy()
 
-            if st.session_state.embedded is not None:
-                rec_val, prec_val, f1_val = compute_detection_metrics(
-                    st.session_state.embedded,
-                    st.session_state.tampered,
-                    rr.detection_mask
-                )
-            else:
-                rec_val, prec_val, f1_val = 0.0, 0.0, 0.0
+        recon_disp = to_display_uint8(rr.bottleneck_recon)
+        recon_disp_rgb = cv2.cvtColor(recon_disp, cv2.COLOR_GRAY2RGB) if recon_disp.ndim == 2 else recon_disp.copy()
 
-            tampered_raw_b64 = image_to_base64(rr.tampered)
-            recovered_raw_b64 = image_to_base64(rr.recovered)
-            mask_raw_b64 = image_to_base64(to_display_uint8(rr.detection_mask))
-            recon_raw_b64 = image_to_base64(rr.bottleneck_recon)
+        mask_bin = (to_display_uint8(rr.detection_mask) > 127).astype(np.uint8)
+        if mask_bin.ndim == 3:
+            mask_bin = mask_bin[:, :, 0]
 
-            repair_unified_html = f"""
-            <style>
-                html, body {{
-                    margin: 0;
-                    padding: 0;
-                    box-sizing: border-box;
-                }}
-                .repair-unified-container {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    background: #ffffff;
-                    border: 1.5px solid #cbd5e1;
-                    border-radius: 10px;
-                    padding: 20px;
-                    box-shadow: 0 4px 14px rgba(0,0,0,0.06);
-                    box-sizing: border-box;
-                    width: 100%;
-                    padding-bottom: 25px;
-                }}
-                .stages-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(4, 1fr);
-                    gap: 14px;
-                    width: 100%;
-                    box-sizing: border-box;
-                }}
-                .stage-card {{
-                    text-align: center;
-                    background: #ffffff;
-                    padding: 8px;
-                    border-radius: 8px;
-                    border: 1.5px solid #cbd5e1;
-                    box-sizing: border-box;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: space-between;
-                }}
-                .stage-card.highlight {{
-                    border: 2px solid #3b82f6;
-                    box-shadow: 0 4px 12px rgba(37,99,235,0.15);
-                }}
-                .img-box-stage {{
-                    width: 100%;
-                    aspect-ratio: 1 / 1;
-                    border: 1.5px solid #000000;
-                    border-radius: 3px;
-                    overflow: hidden;
-                    box-sizing: border-box;
-                    background: #000;
-                }}
-                .img-box-stage img {{
-                    width: 100%;
-                    height: 100%;
-                    object-fit: fill;
-                    display: block;
-                }}
-                .stage-card-title {{
-                    font-size: 13.5px;
-                    font-weight: 700;
-                    color: #1e293b;
-                }}
-                .stage-card-metrics {{
-                    font-size: 12px;
-                    color: #0f172a;
-                    font-weight: 600;
-                    margin-top: 4px;
-                    line-height: 1.4;
-                }}
-            </style>
+        # 綠色標註圖 (正常未被竄改區)
+        green_img = orig_disp_rgb.copy()
+        green_overlay = green_img.copy()
+        green_overlay[:, :] = [34, 197, 94]  # 綠色
+        normal_mask = (mask_bin == 0)
+        green_img[normal_mask] = cv2.addWeighted(green_img[normal_mask], 0.35, green_overlay[normal_mask], 0.65, 0)
 
-            <div class="repair-unified-container">
-                <div style="font-size: 15px; font-weight: 700; color: #1e3a8a; margin-bottom: 5px;">
-                    ✨ 【修復動畫演示】Late Fusion 全息動態掃描修補過程
+        # 紅色標註圖 (被竄改需重建區)
+        red_img = recon_disp_rgb.copy()
+        red_overlay = red_img.copy()
+        red_overlay[:, :] = [239, 68, 68]  # 紅色
+        tamper_mask = (mask_bin == 1)
+        if np.any(tamper_mask):
+            red_img[tamper_mask] = cv2.addWeighted(red_img[tamper_mask], 0.3, red_overlay[tamper_mask], 0.7, 0)
+
+        tampered_raw_b64 = image_to_base64(rr.tampered)
+        recovered_raw_b64 = image_to_base64(rr.recovered)
+        mask_green_b64 = image_to_base64(green_img)
+        recon_red_b64 = image_to_base64(red_img)
+        attack_type_zh = st.session_state.get('attack_type_zh', '文字塗鴉攻擊')
+
+        repair_unified_html = f"""
+        <style>
+            html, body {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            .repair-unified-container {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #ffffff;
+                border: 1.5px solid #cbd5e1;
+                border-radius: 10px;
+                padding: 20px;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.06);
+                box-sizing: border-box;
+                width: 100%;
+                padding-bottom: 25px;
+            }}
+            .fusion-flow-container {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                width: 100%;
+                box-sizing: border-box;
+            }}
+            .stage-card {{
+                flex: 1;
+                text-align: center;
+                background: #ffffff;
+                padding: 8px;
+                border-radius: 8px;
+                border: 1.5px solid #cbd5e1;
+                box-sizing: border-box;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
+            }}
+            .stage-card.highlight {{
+                border: 2px solid #3b82f6;
+                box-shadow: 0 4px 12px rgba(37,99,235,0.15);
+            }}
+            .fusion-operator {{
+                font-size: 22px;
+                font-weight: 700;
+                color: #475569;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                width: 24px;
+            }}
+            .img-box-stage {{
+                width: 100%;
+                aspect-ratio: 1 / 1;
+                border: 1.5px solid #000000;
+                border-radius: 3px;
+                overflow: hidden;
+                box-sizing: border-box;
+                background: #000;
+            }}
+            .img-box-stage img {{
+                width: 100%;
+                height: 100%;
+                object-fit: fill;
+                display: block;
+            }}
+            .stage-card-title {{
+                font-size: 12.5px;
+                font-weight: 700;
+                color: #1e293b;
+                margin-top: 6px;
+                line-height: 1.3;
+            }}
+            .stage-card-metrics {{
+                font-size: 11px;
+                color: #0f172a;
+                font-weight: 600;
+                margin-top: 4px;
+                line-height: 1.3;
+            }}
+        </style>
+
+        <div class="repair-unified-container">
+            <div style="font-size: 15px; font-weight: 700; color: #1e3a8a; margin-bottom: 5px;">
+                ✨ 【修復動畫演示】Late Fusion 全息動態掃描修補過程
+            </div>
+            <div style="font-size: 13px; color: #475569; margin-bottom: 16px; line-height: 1.5;">
+                點擊「播放動態修復掃描」，掃描光束由左至右平移推進：光束左側為無透明度、完全真實修復之影像，右側為受攻擊竄改圖。
+            </div>
+
+            <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap; margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1.5px solid #e2e8f0;">
+                <div style="position: relative; width: 200px; height: 200px; background: #000; border: 1.5px solid #000000; border-radius: 4px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.15); flex-shrink: 0;">
+                    <canvas id="repair-canvas" width="200" height="200" style="width: 200px; height: 200px; display: block;"></canvas>
+                    <div id="repair-scanline" style="position: absolute; top: 0; left: 0; width: 3px; height: 100%; background: #00e5ff; box-shadow: 0 0 12px #00e5ff; display: none;"></div>
                 </div>
-                <div style="font-size: 13px; color: #475569; margin-bottom: 16px; line-height: 1.5;">
-                    點擊「播放動態修復掃描」，掃描光束由左至右平移推進：光束左側為無透明度、完全真實修復之影像，右側為受攻擊竄改圖。
-                </div>
 
-                <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap; margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1.5px solid #e2e8f0;">
-                    <div style="position: relative; width: 200px; height: 200px; background: #000; border: 1.5px solid #000000; border-radius: 4px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.15); flex-shrink: 0;">
-                        <canvas id="repair-canvas" width="200" height="200" style="width: 200px; height: 200px; display: block;"></canvas>
-                        <div id="repair-scanline" style="position: absolute; top: 0; left: 0; width: 3px; height: 100%; background: #00e5ff; box-shadow: 0 0 12px #00e5ff; display: none;"></div>
+                <div style="flex: 1; min-width: 280px;">
+                    <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 5px;" id="repair-status-title">修復進度：準備就緒 (0%)</div>
+                    <div style="font-size: 12.5px; color: #64748b; margin-bottom: 14px;" id="repair-status-desc">畫面展示接收端之受攻擊竄改原圖。</div>
+                    
+                    <div style="width: 100%; height: 8px; background: #e2e8f0; border-radius: 4px; margin-bottom: 18px; overflow: hidden;">
+                        <div id="repair-progress-bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #2563eb, #00e5ff); transition: width 0.08s;"></div>
                     </div>
 
-                    <div style="flex: 1; min-width: 280px;">
-                        <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 5px;" id="repair-status-title">修復進度：準備就緒 (0%)</div>
-                        <div style="font-size: 12.5px; color: #64748b; margin-bottom: 14px;" id="repair-status-desc">畫面展示接收端之受攻擊竄改原圖。</div>
-                        
-                        <div style="width: 100%; height: 8px; background: #e2e8f0; border-radius: 4px; margin-bottom: 18px; overflow: hidden;">
-                            <div id="repair-progress-bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #2563eb, #00e5ff); transition: width 0.08s;"></div>
-                        </div>
-
-                        <div style="display: flex; gap: 10px;">
-                            <button id="btn-start-repair-anim" style="padding: 8px 18px; background: #1d4ed8; border: 1px solid #1e40af; color: #ffffff; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 700; box-shadow: 0 2px 4px rgba(29, 78, 216, 0.25);">
-                                ▶ 播放動態修復掃描
-                            </button>
-                            <button id="btn-reset-repair-anim" style="padding: 8px 14px; background: #f1f5f9; border: 1px solid #cbd5e1; color: #334155; border-radius: 5px; cursor: pointer; font-size: 12.5px; font-weight: 600;">
-                                ⟳ 重設
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                <div>
-                    <div style="font-size: 14.5px; font-weight: 700; color: #1e3a8a; margin-bottom: 14px;">
-                        📷 各階段影像完整對照
-                    </div>
-                    <div class="stages-grid">
-                        
-                        <div class="stage-card">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{tampered_raw_b64}" />
-                            </div>
-                            <div style="margin-top: 8px;">
-                                <div class="stage-card-title">1. 接收影像 (竄改圖)</div>
-                                <div style="font-size: 12px; color: #0f172a; font-weight: 600; margin-top: 4px; line-height: 1.4;">
-                                    <div>竄改率: <span style="color: #2563eb; font-weight: 700;">{tamper_ratio_pct:.2f}%</span></div>
-                                    <div style="color: #64748b; font-size: 11px;">模式: {attack_type_zh}</div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="stage-card">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{mask_raw_b64}" />
-                            </div>
-                            <div style="margin-top: 8px;">
-                                <div class="stage-card-title">2. 最終竄改偵測圖</div>
-                                <div class="stage-card-metrics">
-                                    <div>Recall: <span style="color: #2563eb; font-weight: 700;">{rec_val:.3f}</span></div>
-                                    <div>Precision: <span style="color: #2563eb; font-weight: 700;">{prec_val:.3f}</span></div>
-                                    <div>F1-Score: <span style="color: #059669; font-weight: 700;">{f1_val:.3f}</span></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="stage-card">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{recon_raw_b64}" />
-                            </div>
-                            <div style="margin-top: 8px;">
-                                <div class="stage-card-title">3. 重建影像 (Decoder)</div>
-                                <div class="stage-card-metrics">
-                                    <div>PSNR: <span style="color: #2563eb; font-weight: 700;">{p_recon:.2f} dB</span></div>
-                                    <div>SSIM: <span style="color: #2563eb; font-weight: 700;">{s_recon:.3f}</span></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="stage-card highlight">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{recovered_raw_b64}" />
-                            </div>
-                            <div style="margin-top: 8px;">
-                                <div class="stage-card-title" style="color: #1d4ed8;">4. 最終修復影像</div>
-                                <div class="stage-card-metrics">
-                                    <div>PSNR: <span style="color: #1d4ed8; font-weight: 800;">{p_rec:.2f} dB</span></div>
-                                    <div>SSIM: <span style="color: #1d4ed8; font-weight: 800;">{s_rec:.3f}</span></div>
-                                </div>
-                            </div>
-                        </div>
-
+                    <div style="display: flex; gap: 10px;">
+                        <button id="btn-start-repair-anim" style="padding: 8px 18px; background: #1d4ed8; border: 1px solid #1e40af; color: #ffffff; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 700; box-shadow: 0 2px 4px rgba(29, 78, 216, 0.25);">
+                            ▶ 播放動態修復掃描
+                        </button>
+                        <button id="btn-reset-repair-anim" style="padding: 8px 14px; background: #f1f5f9; border: 1px solid #cbd5e1; color: #334155; border-radius: 5px; cursor: pointer; font-size: 12.5px; font-weight: 600;">
+                            ⟳ 重設
+                        </button>
                     </div>
                 </div>
             </div>
 
-            <script>
-                const rCanvas = document.getElementById('repair-canvas');
-                const rCtx = rCanvas.getContext('2d');
-                const rScanline = document.getElementById('repair-scanline');
-                const rProgressBar = document.getElementById('repair-progress-bar');
-                const rTitle = document.getElementById('repair-status-title');
-                const rDesc = document.getElementById('repair-status-desc');
+            <div>
+                <div style="font-size: 15px; font-weight: 700; color: #1e3a8a; margin-bottom: 14px; text-align: center;">
+                    影像融合
+                </div>
+                
+                <div class="fusion-flow-container">
+                    
+                    <!-- 卡片 1: 接收影像 -->
+                    <div class="stage-card">
+                        <div class="img-box-stage">
+                            <img src="data:image/png;base64,{tampered_raw_b64}" />
+                        </div>
+                        <div style="margin-top: 6px;">
+                            <div class="stage-card-title">接收影像(竄改圖)</div>
+                            <div class="stage-card-metrics" style="margin-top: 6px;">
+                                <div>竄改率: <span style="color: #2563eb; font-weight: 700;">{tamper_ratio_pct:.2f}%</span></div>
+                            </div>
+                        </div>
+                    </div>
 
-                const imgTampered = new Image();
-                imgTampered.src = "data:image/png;base64,{tampered_raw_b64}";
-                const imgRecovered = new Image();
-                imgRecovered.src = "data:image/png;base64,{recovered_raw_b64}";
+                    <div class="fusion-operator">→</div>
 
-                let rTimer = null;
-                let currentSplitX = 0;
+                    <!-- 卡片 2: 正常影像偵測遮罩 (綠色) -->
+                    <div class="stage-card">
+                        <div class="img-box-stage">
+                            <img src="data:image/png;base64,{mask_green_b64}" />
+                        </div>
+                        <div style="margin-top: 6px;">
+                            <div class="stage-card-title">影像融合(正常影像)<br>偵測遮罩</div>
+                            <div class="stage-card-metrics">
+                                <div>Precision: <span style="color: #2563eb; font-weight: 700;">{prec_val:.3f}</span></div>
+                                <div>Recall: <span style="color: #2563eb; font-weight: 700;">{rec_val:.3f}</span></div>
+                                <div>F1-Score: <span style="color: #059669; font-weight: 700;">{f1_val:.3f}</span></div>
+                            </div>
+                        </div>
+                    </div>
 
-                function renderRepairFrame(splitX) {{
-                    const W = 200;
-                    const H = 200;
-                    rCtx.clearRect(0, 0, W, H);
+                    <div class="fusion-operator">+</div>
 
-                    rCtx.drawImage(imgTampered, 0, 0, W, H);
+                    <!-- 卡片 3: Decoder重建影像 (紅色) -->
+                    <div class="stage-card">
+                        <div class="img-box-stage">
+                            <img src="data:image/png;base64,{recon_red_b64}" />
+                        </div>
+                        <div style="margin-top: 6px;">
+                            <div class="stage-card-title">影像融合<br>(Decoder重建影像)</div>
+                            <div class="stage-card-metrics">
+                                <div>PSNR: <span style="color: #2563eb; font-weight: 700;">{p_recon:.2f} dB</span></div>
+                                <div>SSIM: <span style="color: #2563eb; font-weight: 700;">{s_recon:.3f}</span></div>
+                            </div>
+                        </div>
+                    </div>
 
-                    if (splitX > 0) {{
-                        rCtx.save();
-                        rCtx.beginPath();
-                        rCtx.rect(0, 0, splitX, H);
-                        rCtx.clip();
-                        rCtx.globalAlpha = 1.0;
-                        rCtx.drawImage(imgRecovered, 0, 0, W, H);
-                        rCtx.restore();
-                    }}
+                    <div class="fusion-operator">→</div>
+
+                    <!-- 卡片 4: 最終修復影像 -->
+                    <div class="stage-card highlight">
+                        <div class="img-box-stage">
+                            <img src="data:image/png;base64,{recovered_raw_b64}" />
+                        </div>
+                        <div style="margin-top: 6px;">
+                            <div class="stage-card-title" style="color: #1d4ed8;">最終修復影像</div>
+                            <div class="stage-card-metrics" style="margin-top: 14px;">
+                                <div>PSNR: <span style="color: #1d4ed8; font-weight: 800;">{p_rec:.2f} dB</span></div>
+                                <div>SSIM: <span style="color: #1d4ed8; font-weight: 800;">{s_rec:.3f}</span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const rCanvas = document.getElementById('repair-canvas');
+            const rCtx = rCanvas.getContext('2d');
+            const rScanline = document.getElementById('repair-scanline');
+            const rProgressBar = document.getElementById('repair-progress-bar');
+            const rTitle = document.getElementById('repair-status-title');
+            const rDesc = document.getElementById('repair-status-desc');
+
+            const imgTampered = new Image();
+            imgTampered.src = "data:image/png;base64,{tampered_raw_b64}";
+            const imgRecovered = new Image();
+            imgRecovered.src = "data:image/png;base64,{recovered_raw_b64}";
+
+            let rTimer = null;
+            let currentSplitX = 0;
+
+            function renderRepairFrame(splitX) {{
+                const W = 200;
+                const H = 200;
+                rCtx.clearRect(0, 0, W, H);
+
+                rCtx.drawImage(imgTampered, 0, 0, W, H);
+
+                if (splitX > 0) {{
+                    rCtx.save();
+                    rCtx.beginPath();
+                    rCtx.rect(0, 0, splitX, H);
+                    rCtx.clip();
+                    rCtx.globalAlpha = 1.0;
+                    rCtx.drawImage(imgRecovered, 0, 0, W, H);
+                    rCtx.restore();
                 }}
+            }}
 
-                imgTampered.onload = () => {{
-                    renderRepairFrame(0);
-                }};
+            imgTampered.onload = () => {{
+                renderRepairFrame(0);
+            }};
 
-                document.getElementById('btn-start-repair-anim').addEventListener('click', () => {{
-                    if (rTimer) clearInterval(rTimer);
-                    rScanline.style.display = 'block';
-                    currentSplitX = 0;
-                    const totalW = 200;
+            document.getElementById('btn-start-repair-anim').addEventListener('click', () => {{
+                if (rTimer) clearInterval(rTimer);
+                rScanline.style.display = 'block';
+                currentSplitX = 0;
+                const totalW = 200;
 
-                    rTitle.textContent = "修復進度：動態掃描修復中...";
-                    rDesc.textContent = "光束左側呈現 100% 無透明度之真實融合修復結果...";
+                rTitle.textContent = "修復進度：動態掃描修復中...";
+                rDesc.textContent = "光束左側呈現 100% 無透明度之真實融合修復結果...";
 
-                    rTimer = setInterval(() => {{
-                        currentSplitX += 3;
-                        const pct = Math.min(100, Math.round((currentSplitX / totalW) * 100));
-                        rProgressBar.style.width = pct + "%";
-                        rScanline.style.left = currentSplitX + "px";
-                        renderRepairFrame(currentSplitX);
+                rTimer = setInterval(() => {{
+                    currentSplitX += 3;
+                    const pct = Math.min(100, Math.round((currentSplitX / totalW) * 100));
+                    rProgressBar.style.width = pct + "%";
+                    rScanline.style.left = currentSplitX + "px";
+                    renderRepairFrame(currentSplitX);
 
-                        if (currentSplitX >= totalW) {{
-                            clearInterval(rTimer);
-                            rScanline.style.display = 'none';
-                            renderRepairFrame(totalW);
-                            rTitle.textContent = "修復進度：100% 完整修復完成！";
-                            rDesc.textContent = "已完成融合：未受損區域維持原清晰度，受損區域由 Bottleneck 重建無縫填補。";
-                            rProgressBar.style.width = "100%";
-                        }}
-                    }}, 25);
-                }});
+                    if (currentSplitX >= totalW) {{
+                        clearInterval(rTimer);
+                        rScanline.style.display = 'none';
+                        renderRepairFrame(totalW);
+                        rTitle.textContent = "修復進度：100% 完整修復完成！";
+                        rDesc.textContent = "已完成融合：未受損區域維持原清晰度，受損區域由 Bottleneck 重建無縫填補。";
+                        rProgressBar.style.width = "100%";
+                    }}
+                }}, 25);
+            }});
 
-                document.getElementById('btn-reset-repair-anim').addEventListener('click', () => {{
-                    if (rTimer) clearInterval(rTimer);
-                    rScanline.style.display = 'none';
-                    currentSplitX = 0;
-                    renderRepairFrame(0);
-                    rProgressBar.style.width = "0%";
-                    rTitle.textContent = "修復進度：準備就緒 (0%)";
-                    rDesc.textContent = "畫面展示接收端之受攻擊竄改原圖。";
-                }});
-            </script>
-            """
+            document.getElementById('btn-reset-repair-anim').addEventListener('click', () => {{
+                if (rTimer) clearInterval(rTimer);
+                rScanline.style.display = 'none';
+                currentSplitX = 0;
+                renderRepairFrame(0);
+                rProgressBar.style.width = "0%";
+                rTitle.textContent = "修復進度：準備就緒 (0%)";
+                rDesc.textContent = "畫面展示接收端之受攻擊竄改原圖。";
+            }});
+        </script>
+        """
 
-            components.html(repair_unified_html, height=800, scrolling=False)
+        components.html(repair_unified_html, height=830, scrolling=False)
