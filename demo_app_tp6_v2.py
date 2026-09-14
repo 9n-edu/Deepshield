@@ -461,6 +461,7 @@ def init_session():
         "tab1_collage_uploader_key": 0,
         "tab2_collage_uploader_key": 0,
         "manual_tampered_cache": None,
+        "scrollTo": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -801,6 +802,7 @@ with tab_overall:
         with st.spinner("系統正在比對破損區域並進行修復..."):
             success = execute_tamper_and_recover()
         if success:
+            st.session_state.scrollTo = "sec-recovery"
             st.success("🎉 全流程驗證完成！請查看下方測試成果。")
             st.rerun()
 
@@ -1633,7 +1635,7 @@ with tab_detail:
                 load_different_collage_default_image()
     
             if attack_type == "custom_paint":
-                st.caption("點擊下方按鈕將彈出獨立視窗，用滑鼠繪畫，按 S 鍵儲存確認、按 Q 鍵離開。")
+                st.caption("點擊下方按鈕將彈出獨立視窗，用滑鼠繪畫，按 S 鍵儲存確認、按 Q 鍵離開。↑/↓ 調整筆刷粗細，←/→ 分別為 Undo / Redo。")
                 if st.button("🎨 開啟繪畫視窗進行手動塗鴉", use_container_width=True, key="btn_open_cv_paint_tab2"):
                     if st.session_state.embedded is not None:
                         res_draw = open_opencv_drawing_window(st.session_state.embedded)
@@ -1705,6 +1707,7 @@ with tab_detail:
                     success = execute_tamper_and_recover()
 
                 if success:
+                    st.session_state.detail_step = "偵測竄改區域"
                     st.success("🎉 已同步更新整體流程與詳細流程結果！")
                     st.rerun()
         with step2_view:
@@ -2594,7 +2597,7 @@ with tab_detail:
             components.html(tamper_stepper_html, height=800, scrolling=False)
 
     elif cur_step == "修復影像":
-        st.markdown("### 🔹 修復影像(利用可信任之Bottleneck資訊修復)")
+        st.markdown("### 🔹 修復影像 (利用可信任之 Bottleneck 資訊修復)")
 
         if st.session_state.original is None:
             load_system_default_image()
@@ -2625,7 +2628,6 @@ with tab_detail:
         if rr is None:
             st.warning("無法載入修復結果，請確認影像狀態。")
         else:
-            p_tampered, s_tampered = calculate_correct_psnr_ssim(st.session_state.original, rr.tampered)
             p_rec, s_rec = calculate_correct_psnr_ssim(st.session_state.original, rr.recovered)
             p_recon, s_recon = calculate_correct_psnr_ssim(st.session_state.original, rr.bottleneck_recon)
 
@@ -2648,8 +2650,8 @@ with tab_detail:
             else:
                 rec_val, prec_val, f1_val = 0.0, 0.0, 0.0
 
-            # 產生綠色遮罩（正常保留區）與紅色遮罩（重建修補區）視覺圖
-            orig_disp = to_display_uint8(st.session_state.tampered)
+            # 準備各階段影像與遮罩
+            orig_disp = to_display_uint8(rr.tampered)
             orig_disp_rgb = cv2.cvtColor(orig_disp, cv2.COLOR_GRAY2RGB) if orig_disp.ndim == 2 else orig_disp.copy()
 
             recon_disp = to_display_uint8(rr.bottleneck_recon)
@@ -2659,14 +2661,14 @@ with tab_detail:
             if mask_bin.ndim == 3:
                 mask_bin = mask_bin[:, :, 0]
 
-            # 綠色標註圖 (正常未被竄改區)
+            # 階段 2 圖：綠色標註正常未篡改區域
             green_img = orig_disp_rgb.copy()
             green_overlay = green_img.copy()
             green_overlay[:, :] = [34, 197, 94]  # 綠色
             normal_mask = (mask_bin == 0)
             green_img[normal_mask] = cv2.addWeighted(green_img[normal_mask], 0.35, green_overlay[normal_mask], 0.65, 0)
 
-            # 紅色標註圖 (被竄改需重建區)
+            # 階段 3 圖：重建影像上方用半透明紅色標記需替換區域
             red_img = recon_disp_rgb.copy()
             red_overlay = red_img.copy()
             red_overlay[:, :] = [239, 68, 68]  # 紅色
@@ -2674,276 +2676,267 @@ with tab_detail:
             if np.any(tamper_mask):
                 red_img[tamper_mask] = cv2.addWeighted(red_img[tamper_mask], 0.3, red_overlay[tamper_mask], 0.7, 0)
 
+            # 階段 3：保留接收影像中未篡改區域
+            stage3_img = orig_disp_rgb.copy()
+            stage3_mask = (mask_bin == 1)
+            stage3_img[stage3_mask] = [0, 0, 0]
+
+            # 階段 5：保留重建影像，需進行替換之區域
+            stage5_img = recon_disp_rgb.copy()
+            stage5_mask = (mask_bin == 0)
+            stage5_img[stage5_mask] = [0, 0, 0]
+
+            # 轉為 Base64 供 HTML 顯示
+            img0_b64 = image_to_base64(rr.tampered)
+            img1_b64 = image_to_base64(rr.detection_mask)
+            img2_b64 = image_to_base64(stage3_img)
+            img3_b64 = image_to_base64(rr.bottleneck_recon)
+            img4_b64 = image_to_base64(stage5_img)
+            img5_b64 = image_to_base64(rr.recovered)
+
             tampered_raw_b64 = image_to_base64(rr.tampered)
             recovered_raw_b64 = image_to_base64(rr.recovered)
             mask_green_b64 = image_to_base64(green_img)
             recon_red_b64 = image_to_base64(red_img)
-            attack_type_zh = st.session_state.get('attack_type_zh', '文字塗鴉攻擊')
 
-            repair_unified_html = f"""
+            repair_stepper_html = """
             <style>
-                html, body {{
-                    margin: 0;
-                    padding: 0;
-                    box-sizing: border-box;
-                }}
-                .repair-unified-container {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                .stepper-container {
                     background: #ffffff;
-                    border: 1.5px solid #cbd5e1;
+                    border: 2px solid #cbd5e1;
                     border-radius: 10px;
-                    padding: 20px;
-                    box-shadow: 0 4px 14px rgba(0,0,0,0.06);
+                    padding: 18px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                     box-sizing: border-box;
                     width: 100%;
-                    padding-bottom: 25px;
-                }}
-                .fusion-flow-container {{
-                    display: flex;
-                    align-items: center;
-                    justify-content: space-between;
-                    gap: 8px;
-                    width: 100%;
-                    box-sizing: border-box;
-                }}
-                .stage-card {{
-                    flex: 1;
-                    text-align: center;
-                    background: #ffffff;
-                    padding: 8px;
-                    border-radius: 8px;
-                    border: 1.5px solid #cbd5e1;
-                    box-sizing: border-box;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: space-between;
-                }}
-                .stage-card.highlight {{
-                    border: 2px solid #3b82f6;
-                    box-shadow: 0 4px 12px rgba(37,99,235,0.15);
-                }}
-                .fusion-operator {{
-                    font-size: 22px;
-                    font-weight: 700;
-                    color: #475569;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    flex-shrink: 0;
-                    width: 24px;
-                }}
-                .img-box-stage {{
-                    width: 100%;
-                    aspect-ratio: 1 / 1;
-                    border: 1.5px solid #000000;
-                    border-radius: 3px;
-                    overflow: hidden;
-                    box-sizing: border-box;
-                    background: #000;
-                }}
-                .img-box-stage img {{
-                    width: 100%;
-                    height: 100%;
-                    object-fit: fill;
-                    display: block;
-                }}
-                .stage-card-title {{
-                    font-size: 12.5px;
-                    font-weight: 700;
-                    color: #1e293b;
-                    margin-top: 6px;
-                    line-height: 1.3;
-                }}
-                .stage-card-metrics {{
+                }
+                .node-btn-grid {
+                    display: grid;
+                    grid-template-columns: repeat(6, 1fr);
+                    gap: 6px;
+                    margin-bottom: 12px;
+                }
+                .node-btn {
+                    padding: 8px 3px;
                     font-size: 11px;
-                    color: #0f172a;
-                    font-weight: 600;
-                    margin-top: 4px;
-                    line-height: 1.3;
-                }}
+                    font-weight: 700;
+                    border-radius: 6px;
+                    border: 2px solid #cbd5e1;
+                    background: #f8fafc;
+                    color: #475569;
+                    cursor: pointer;
+                    transition: all 0.15s;
+                    text-align: center;
+                    line-height: 1.35;
+                }
+                .node-btn:hover {
+                    background: #e2e8f0;
+                }
+                .node-btn.active {
+                    background: #2563eb !important;
+                    color: #ffffff !important;
+                    border-color: #1d4ed8 !important;
+                    box-shadow: 0 2px 6px rgba(37, 99, 235, 0.25);
+                }
             </style>
 
-            <div class="repair-unified-container">
-                <div style="font-size: 15px; font-weight: 700; color: #1e3a8a; margin-bottom: 5px;">
-                    ✨ 【修復動畫演示】Late Fusion 全息動態掃描修補過程
+            <div class="stepper-container">
+                <div style="font-size: 14.5px; font-weight: 700; color: #1e3a8a; margin-bottom: 4px;">
+                    ✨ 影像修復 6 階段演變檢視
                 </div>
-                <div style="font-size: 13px; color: #475569; margin-bottom: 16px; line-height: 1.5;">
-                    點擊「播放動態修復掃描」，掃描光束由左至右平移推進：光束左側為無透明度、完全真實修復之影像，右側為受攻擊竄改圖。
+                <div style="font-size: 12px; color: #64748b; margin-bottom: 14px;">
+                    點選上方按鈕、拖動橫條或點擊下方縮圖切換檢視；點擊「▶ 播放 6 階段連續演變動畫」可自動依序動態播放。
                 </div>
 
-                <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap; margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1.5px solid #e2e8f0;">
-                    <div style="position: relative; width: 200px; height: 200px; background: #000; border: 1.5px solid #000000; border-radius: 4px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.15); flex-shrink: 0;">
-                        <canvas id="repair-canvas" width="200" height="200" style="width: 200px; height: 200px; display: block;"></canvas>
-                        <div id="repair-scanline" style="position: absolute; top: 0; left: 0; width: 3px; height: 100%; background: #00e5ff; box-shadow: 0 0 12px #00e5ff; display: none;"></div>
+                <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap;">
+                    <div style="position: relative; width: 170px; height: 170px; background: #000; border: 2px solid #334155; border-radius: 6px; overflow: hidden; flex-shrink: 0; box-shadow: 0 4px 10px rgba(0,0,0,0.15);">
+                        <img id="stepper-img" src="data:image/png;base64,IMG0_B64" style="width: 100%; height: 100%; display: block; object-fit: fill; image-rendering: pixelated;" />
                     </div>
 
-                    <div style="flex: 1; min-width: 280px;">
-                        <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 5px;" id="repair-status-title">修復進度：準備就緒 (0%)</div>
-                        <div style="font-size: 12.5px; color: #64748b; margin-bottom: 14px;" id="repair-status-desc">畫面展示接收端之受攻擊竄改原圖。</div>
-                        
-                        <div style="width: 100%; height: 8px; background: #e2e8f0; border-radius: 4px; margin-bottom: 18px; overflow: hidden;">
-                            <div id="repair-progress-bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #2563eb, #00e5ff); transition: width 0.08s;"></div>
+                    <div style="flex: 1; min-width: 420px;">
+                        <div class="node-btn-grid">
+                            <button class="node-btn active" id="btn-node-0">1. 接收影像</button>
+                            <button class="node-btn" id="btn-node-1">2. 竄改偵測圖</button>
+                            <button class="node-btn" id="btn-node-2">3. 保留未篡改區</button>
+                            <button class="node-btn" id="btn-node-3">4. 重建影像</button>
+                            <button class="node-btn" id="btn-node-4">5. 需替換區域</button>
+                            <button class="node-btn" id="btn-node-5">6. 最終修復影像</button>
                         </div>
 
-                        <div style="display: flex; gap: 10px;">
-                            <button id="btn-start-repair-anim" style="padding: 8px 18px; background: #1d4ed8; border: 1px solid #1e40af; color: #ffffff; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 700; box-shadow: 0 2px 4px rgba(29, 78, 216, 0.25);">
-                                ▶ 播放動態修復掃描
+                        <div style="margin-bottom: 10px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 3px; font-weight: 600;">
+                                <span id="node-label" style="color: #1d4ed8;">目前階段：1. 接收影像</span>
+                                <span style="color: #64748b;">階段 <span id="node-val">0</span> / 5</span>
+                            </div>
+                            <input type="range" id="stepper-slider" min="0" max="5" value="0" step="1" style="width: 100%; accent-color: #2563eb; cursor: pointer;">
+                        </div>
+
+                        <div id="node-desc" style="font-size: 12px; color: #475569; line-height: 1.45; min-height: 38px; margin-bottom: 10px; background: #f8fafc; padding: 6px 10px; border-radius: 6px; border: 1px solid #e2e8f0;">
+                            <b>1. 接收影像</b>：接收端所收到遭受破壞之原始輸入圖 (竄改率: TAMPER_PCT%)。
+                        </div>
+
+                        <div style="display: flex; gap: 8px;">
+                            <button id="btn-auto-play-stepper" style="padding: 7px 16px; background: #2563eb; border: 1px solid #1d4ed8; color: #fff; border-radius: 5px; cursor: pointer; font-size: 12px; font-weight: 700;">
+                                ▶ 播放 6 階段連續演變動畫
                             </button>
-                            <button id="btn-reset-repair-anim" style="padding: 8px 14px; background: #f1f5f9; border: 1px solid #cbd5e1; color: #334155; border-radius: 5px; cursor: pointer; font-size: 12.5px; font-weight: 600;">
-                                ⟳ 重設
+                            <button id="btn-reset-stepper" style="padding: 7px 12px; background: #f1f5f9; border: 1px solid #cbd5e1; color: #334155; border-radius: 5px; cursor: pointer; font-size: 12px; font-weight: 600;">
+                                ⟳ 重設至階段 0
                             </button>
                         </div>
-                    </div>
-                </div>
-
-                <div>
-                    <div style="font-size: 15px; font-weight: 700; color: #1e3a8a; margin-bottom: 14px; text-align: center;">
-                        影像融合
-                    </div>
-                    
-                    <div class="fusion-flow-container">
-                        
-                        <!-- 卡片 1: 接收影像 -->
-                        <div class="stage-card">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{tampered_raw_b64}" />
-                            </div>
-                            <div style="margin-top: 6px;">
-                                <div class="stage-card-title">接收影像(竄改圖)</div>
-                                <div class="stage-card-metrics" style="margin-top: 6px;">
-                                    <div>竄改率: <span style="color: #2563eb; font-weight: 700;">{tamper_ratio_pct:.2f}%</span></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="fusion-operator">→</div>
-
-                        <!-- 卡片 2: 正常影像偵測遮罩 (綠色) -->
-                        <div class="stage-card">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{mask_green_b64}" />
-                            </div>
-                            <div style="margin-top: 6px;">
-                                <div class="stage-card-title">影像融合(正常影像)<br>偵測遮罩</div>
-                                <div class="stage-card-metrics">
-                                    <div>Precision: <span style="color: #2563eb; font-weight: 700;">{prec_val:.3f}</span></div>
-                                    <div>Recall: <span style="color: #2563eb; font-weight: 700;">{rec_val:.3f}</span></div>
-                                    <div>F1-Score: <span style="color: #059669; font-weight: 700;">{f1_val:.3f}</span></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="fusion-operator">+</div>
-
-                        <!-- 卡片 3: Decoder重建影像 (紅色) -->
-                        <div class="stage-card">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{recon_red_b64}" />
-                            </div>
-                            <div style="margin-top: 6px;">
-                                <div class="stage-card-title">影像融合<br>(Decoder重建影像)</div>
-                                <div class="stage-card-metrics">
-                                    <div>PSNR: <span style="color: #2563eb; font-weight: 700;">{p_recon:.2f} dB</span></div>
-                                    <div>SSIM: <span style="color: #2563eb; font-weight: 700;">{s_recon:.3f}</span></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="fusion-operator">→</div>
-
-                        <!-- 卡片 4: 最終修復影像 -->
-                        <div class="stage-card highlight">
-                            <div class="img-box-stage">
-                                <img src="data:image/png;base64,{recovered_raw_b64}" />
-                            </div>
-                            <div style="margin-top: 6px;">
-                                <div class="stage-card-title" style="color: #1d4ed8;">最終修復影像</div>
-                                <div class="stage-card-metrics" style="margin-top: 14px;">
-                                    <div>PSNR: <span style="color: #1d4ed8; font-weight: 800;">{p_rec:.2f} dB</span></div>
-                                    <div>SSIM: <span style="color: #1d4ed8; font-weight: 800;">{s_rec:.3f}</span></div>
-                                </div>
-                            </div>
-                        </div>
-
                     </div>
                 </div>
             </div>
 
             <script>
-                const rCanvas = document.getElementById('repair-canvas');
-                const rCtx = rCanvas.getContext('2d');
-                const rScanline = document.getElementById('repair-scanline');
-                const rProgressBar = document.getElementById('repair-progress-bar');
-                const rTitle = document.getElementById('repair-status-title');
-                const rDesc = document.getElementById('repair-status-desc');
+                const nodeImages = [
+                    "data:image/png;base64,IMG0_B64",
+                    "data:image/png;base64,IMG1_B64",
+                    "data:image/png;base64,IMG2_B64",
+                    "data:image/png;base64,IMG3_B64",
+                    "data:image/png;base64,IMG4_B64",
+                    "data:image/png;base64,IMG5_B64"
+                ];
 
-                const imgTampered = new Image();
-                imgTampered.src = "data:image/png;base64,{tampered_raw_b64}";
-                const imgRecovered = new Image();
-                imgRecovered.src = "data:image/png;base64,{recovered_raw_b64}";
+                const nodeDescriptions = [
+                    "<b>1. 接收影像</b>：接收端所收到遭受破壞之原始輸入圖 (竄改率: TAMPER_PCT%)。",
+                    "<b>2. 竄改偵測圖</b>：透過多數決與形態學定位出破損二值遮罩。",
+                    "<b>3. 保留接收影像中未篡改區域</b>：濾除受損區，精準保留正常背景與細節。",
+                    "<b>4. 重建影像</b>：由 Decoder 透過可信任特徵全圖重建 (PSNR: P_RECON dB)。",
+                    "<b>5. 保留重建影像，需進行替換之區域</b>：擷取重建圖中對應破損位置的修補內容。",
+                    "<b>6. 最終修復影像</b>：Late Fusion 完美融合，無縫填補修復 (PSNR: P_REC dB)。"
+                ];
 
-                let rTimer = null;
-                let currentSplitX = 0;
+                const nodeTitles = [
+                    "目前階段：1. 接收影像",
+                    "目前階段：2. 竄改偵測圖",
+                    "目前階段：3. 保留接收影像中未篡改區域",
+                    "目前階段：4. 重建影像",
+                    "目前階段：5. 保留重建影像，需進行替換之區域",
+                    "目前階段：6. 最終修復影像"
+                ];
 
-                function renderRepairFrame(splitX) {{
-                    const W = 200;
-                    const H = 200;
-                    rCtx.clearRect(0, 0, W, H);
+                const stepperImg = document.getElementById('stepper-img');
+                const stepperSlider = document.getElementById('stepper-slider');
+                const nodeVal = document.getElementById('node-val');
+                const nodeLabel = document.getElementById('node-label');
+                const nodeDesc = document.getElementById('node-desc');
+                const nodeBtns = [
+                    document.getElementById('btn-node-0'),
+                    document.getElementById('btn-node-1'),
+                    document.getElementById('btn-node-2'),
+                    document.getElementById('btn-node-3'),
+                    document.getElementById('btn-node-4'),
+                    document.getElementById('btn-node-5')
+                ];
 
-                    rCtx.drawImage(imgTampered, 0, 0, W, H);
+                let animStepperTimer = null;
 
-                    if (splitX > 0) {{
-                        rCtx.save();
-                        rCtx.beginPath();
-                        rCtx.rect(0, 0, splitX, H);
-                        rCtx.clip();
-                        rCtx.globalAlpha = 1.0;
-                        rCtx.drawImage(imgRecovered, 0, 0, W, H);
-                        rCtx.restore();
-                    }}
-                }}
+                function switchNode(idx) {
+                    stepperSlider.value = idx;
+                    nodeVal.textContent = idx;
+                    stepperImg.src = nodeImages[idx];
+                    nodeLabel.innerHTML = nodeTitles[idx];
+                    nodeDesc.innerHTML = nodeDescriptions[idx];
 
-                imgTampered.onload = () => {{
-                    renderRepairFrame(0);
-                }};
+                    nodeBtns.forEach((btn, bIdx) => {
+                        if (bIdx === idx) btn.classList.add('active');
+                        else btn.classList.remove('active');
+                    });
+                }
 
-                document.getElementById('btn-start-repair-anim').addEventListener('click', () => {{
-                    if (rTimer) clearInterval(rTimer);
-                    rScanline.style.display = 'block';
-                    currentSplitX = 0;
-                    const totalW = 200;
+                stepperSlider.addEventListener('input', (e) => {
+                    if (animStepperTimer) clearInterval(animStepperTimer);
+                    switchNode(parseInt(e.target.value));
+                });
 
-                    rTitle.textContent = "修復進度：動態掃描修復中...";
-                    rDesc.textContent = "光束左側呈現 100% 無透明度之真實融合修復結果...";
+                nodeBtns.forEach((btn, idx) => {
+                    btn.addEventListener('click', () => {
+                        if (animStepperTimer) clearInterval(animStepperTimer);
+                        switchNode(idx);
+                    });
+                });
 
-                    rTimer = setInterval(() => {{
-                        currentSplitX += 3;
-                        const pct = Math.min(100, Math.round((currentSplitX / totalW) * 100));
-                        rProgressBar.style.width = pct + "%";
-                        rScanline.style.left = currentSplitX + "px";
-                        renderRepairFrame(currentSplitX);
+                document.getElementById('btn-auto-play-stepper').addEventListener('click', () => {
+                    if (animStepperTimer) clearInterval(animStepperTimer);
+                    let cur = 0;
+                    switchNode(cur);
+                    animStepperTimer = setInterval(() => {
+                        cur++;
+                        if (cur <= 5) {
+                            switchNode(cur);
+                        } else {
+                            clearInterval(animStepperTimer);
+                        }
+                    }, 900);
+                });
 
-                        if (currentSplitX >= totalW) {{
-                            clearInterval(rTimer);
-                            rScanline.style.display = 'none';
-                            renderRepairFrame(totalW);
-                            rTitle.textContent = "修復進度：100% 完整修復完成！";
-                            rDesc.textContent = "已完成融合：未受損區域維持原清晰度，受損區域由 Bottleneck 重建無縫填補。";
-                            rProgressBar.style.width = "100%";
-                        }}
-                    }}, 25);
-                }});
-
-                document.getElementById('btn-reset-repair-anim').addEventListener('click', () => {{
-                    if (rTimer) clearInterval(rTimer);
-                    rScanline.style.display = 'none';
-                    currentSplitX = 0;
-                    renderRepairFrame(0);
-                    rProgressBar.style.width = "0%";
-                    rTitle.textContent = "修復進度：準備就緒 (0%)";
-                    rDesc.textContent = "畫面展示接收端之受攻擊竄改原圖。";
-                }});
+                document.getElementById('btn-reset-stepper').addEventListener('click', () => {
+                    if (animStepperTimer) clearInterval(animStepperTimer);
+                    switchNode(0);
+                });
             </script>
             """
 
-            components.html(repair_unified_html, height=830, scrolling=False)
+            repair_stepper_html = repair_stepper_html.replace("IMG0_B64", img0_b64)
+            repair_stepper_html = repair_stepper_html.replace("IMG1_B64", img1_b64)
+            repair_stepper_html = repair_stepper_html.replace("IMG2_B64", img2_b64)
+            repair_stepper_html = repair_stepper_html.replace("IMG3_B64", img3_b64)
+            repair_stepper_html = repair_stepper_html.replace("IMG4_B64", img4_b64)
+            repair_stepper_html = repair_stepper_html.replace("IMG5_B64", img5_b64)
+            repair_stepper_html = repair_stepper_html.replace("TAMPER_PCT", f"{tamper_ratio_pct:.1f}")
+            repair_stepper_html = repair_stepper_html.replace("P_RECON", f"{p_recon:.1f}")
+            repair_stepper_html = repair_stepper_html.replace("P_REC", f"{p_rec:.1f}")
+
+            components.html(repair_stepper_html, height=350, scrolling=False)
+
+            st.markdown("---")
+            st.markdown("#### 影像融合")
+
+            # 下方 4 張圖並排呈現
+            col_f1, col_op1, col_f2, col_op2, col_f3, col_op3, col_f4 = st.columns([1, 0.2, 1, 0.2, 1, 0.2, 1])
+
+            with col_f1:
+                st.image(to_rgb(rr.tampered), caption="接收影像(竄改圖)", use_container_width=True)
+                st.markdown(f"<div style='text-align: center; font-size: 11px; font-weight: 600;'>竄改率: {tamper_ratio_pct:.2f}%</div>", unsafe_allow_html=True)
+
+            with col_op1:
+                st.markdown("<div style='text-align: center; font-size: 22px; font-weight: bold; color: #475569; padding-top: 80px;'>→</div>", unsafe_allow_html=True)
+
+            with col_f2:
+                st.image(to_rgb(green_img), caption="影像融合(正常影像)\n偵測遮罩", use_container_width=True)
+                st.markdown(f"<div style='text-align: center; font-size: 11px; font-weight: 600;'>Precision: {prec_val:.3f}<br>Recall: {rec_val:.3f}<br>F1-Score: {f1_val:.3f}</div>", unsafe_allow_html=True)
+
+            with col_op2:
+                st.markdown("<div style='text-align: center; font-size: 22px; font-weight: bold; color: #475569; padding-top: 80px;'>+</div>", unsafe_allow_html=True)
+
+            with col_f3:
+                st.image(to_rgb(red_img), caption="影像融合\n(Decoder重建影像)", use_container_width=True)
+                st.markdown(f"<div style='text-align: center; font-size: 11px; font-weight: 600;'>PSNR: {p_recon:.2f} dB<br>SSIM: {s_recon:.3f}</div>", unsafe_allow_html=True)
+
+            with col_op3:
+                st.markdown("<div style='text-align: center; font-size: 22px; font-weight: bold; color: #475569; padding-top: 80px;'>→</div>", unsafe_allow_html=True)
+
+            with col_f4:
+                st.image(to_rgb(rr.recovered), caption="最終修復影像", use_container_width=True)
+                st.markdown(f"<div style='text-align: center; font-size: 11px; font-weight: 600; color: #1d4ed8;'>PSNR: {p_rec:.2f} dB<br>SSIM: {s_rec:.3f}</div>", unsafe_allow_html=True)
+
+# =========================================================================
+# 自動滾動與畫面定位監聽器
+# =========================================================================
+if st.session_state.scrollTo:
+    target_id = st.session_state.scrollTo
+    st.session_state.scrollTo = None  # 執行後清除狀態
+    st.markdown(
+        f"""
+        <script>
+        setTimeout(function() {{
+            const target = window.parent.document.getElementById('{target_id}') || window.parent.document.querySelector('#{target_id}');
+            if (target) {{
+                target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            }}
+        }}, 300);
+        </script>
+        """,
+        unsafe_allow_html=True
+    )
