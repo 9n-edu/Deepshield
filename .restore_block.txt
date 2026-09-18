@@ -1,0 +1,330 @@
+﻿    """?芰撖阡?霈??Tab ?批?辣?湔?曹澈?餅????""
+    type_seen_key = f"_{scope}_attack_type_seen"
+    ratio_seen_key = f"_{scope}_attack_ratio_seen"
+    type_changed = st.session_state.get(type_seen_key) != attack_type
+    ratio_changed = attack_ratio is not None and st.session_state.get(ratio_seen_key) != attack_ratio
+
+    st.session_state[type_seen_key] = attack_type
+    if attack_ratio is not None:
+        st.session_state[ratio_seen_key] = attack_ratio
+
+    state_changed = False
+    if type_changed and st.session_state.attack_type != attack_type:
+        st.session_state.attack_type = attack_type
+        state_changed = True
+    if ratio_changed and st.session_state.attack_ratio != attack_ratio:
+        st.session_state.attack_ratio = attack_ratio
+        state_changed = True
+
+    if state_changed:
+        st.session_state.tampered = None
+        st.session_state.recover_result = None
+        if attack_type != "custom_paint":
+            st.session_state.manual_tampered_cache = None
+    return state_changed
+
+
+def open_opencv_drawing_window(img_gray: np.ndarray) -> np.ndarray:
+    """敶 OpenCV 閬?霈蝙?刻皛???憛?嚗?
+       ??憓?蝑蝎敦
+       ??皜?蝑蝎敦
+       ???銝?甇伐?Undo嚗?       ????銝?甇伐?Redo嚗?       S嚗摮Ⅱ隤?       Q / ESC嚗?瘨?    """
+
+    vis_base = cv2.cvtColor(
+        to_display_uint8(img_gray),
+        cv2.COLOR_GRAY2BGR
+    )
+
+    vis = vis_base.copy()
+
+    # Undo 甇瑕
+    history = [vis.copy()]
+
+    # Redo 甇瑕
+    redo_history = []
+
+    drawing = False
+    last_x, last_y = -1, -1
+
+    # ??蝑蝎敦
+    brush_thickness = 3
+
+    def draw_callback(event, x, y, flags, param):
+        nonlocal drawing, last_x, last_y, vis
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            drawing = True
+            last_x, last_y = x, y
+
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if drawing:
+                cv2.line(
+                    vis,
+                    (last_x, last_y),
+                    (x, y),
+                    (0, 0, 0),
+                    brush_thickness
+                )
+
+                last_x, last_y = x, y
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            if drawing:
+                drawing = False
+
+                # 摰?銝蝑?閮?甇瑕
+                history.append(vis.copy())
+
+                # ?芾??Ｙ??啁?蝑嚗停皜 Redo
+                redo_history.clear()
+
+    window_name = (
+        "Manual Tamper "
+        "(S: Save, Q: Quit, "
+        "Up/Down: Brush, Left: Undo, Right: Redo)"
+    )
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, draw_callback)
+
+    while True:
+
+        # 憿舐內?桀?敶勗?
+        display_frame = vis.copy()
+
+        # 憿舐內?桀?蝑憭批?
+        cv2.putText(
+            display_frame,
+            f"Brush: {brush_thickness}",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2
+        )
+
+        cv2.imshow(window_name, display_frame)
+
+        key = cv2.waitKeyEx(1)
+
+        # ==================================================
+        # S嚗摮?/ 蝣箄?
+        # ==================================================
+        if key in (ord('s'), ord('S')):
+            break
+
+        # ==================================================
+        # Q / ESC嚗?瘨?        # ==================================================
+        elif key in (ord('q'), ord('Q'), 27):
+            vis = vis_base.copy()
+            break
+
+        # ==================================================
+        # Z / Backspace嚗ndo
+        # 靽???翰?琿
+        # ==================================================
+        elif key in (ord('z'), ord('Z'), 8):
+            if len(history) > 1:
+                redo_history.append(history.pop())
+                vis = history[-1].copy()
+
+        # ==================================================
+        # ??憓?蝑蝎敦
+        # ==================================================
+        elif key in (2490368, 82):
+            brush_thickness = min(
+                40,
+                brush_thickness + 2
+            )
+
+        # ==================================================
+        # ??皜?蝑蝎敦
+        # ==================================================
+        elif key in (2621440, 84):
+            brush_thickness = max(
+                2,
+                brush_thickness - 2
+            )
+
+        # ==================================================
+        # ??Undo
+        # ==================================================
+        elif key in (2424832, 81):
+            if len(history) > 1:
+                redo_history.append(history.pop())
+                vis = history[-1].copy()
+
+        # ==================================================
+        # ??Redo
+        # ==================================================
+        elif key in (2555904, 83):
+            if len(redo_history) > 0:
+                restored = redo_history.pop()
+
+                history.append(restored.copy())
+                vis = restored.copy()
+
+    cv2.destroyAllWindows()
+
+    return cv2.cvtColor(
+        vis,
+        cv2.COLOR_BGR2GRAY
+    )
+
+
+def matrix_to_base64_gray_figure(matrix: np.ndarray, title: str) -> str:
+    fig, ax = plt.subplots(figsize=(2.5, 2.5), dpi=100)
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#ffffff")
+    im = ax.imshow(matrix, cmap="gray", vmin=0, vmax=255)
+    ax.set_title(title, fontsize=9, color="#0f172a", pad=4, fontweight="bold")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.yaxis.set_tick_params(color="#334155", labelsize=6.5)
+    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="#334155")
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor(), transparent=False)
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def image_to_base64(img: np.ndarray) -> str:
+    rgb = to_rgb(img)
+    _, buffer = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return base64.b64encode(buffer).decode("utf-8")
+
+
+def calculate_correct_psnr_ssim(img_a: np.ndarray, img_b: np.ndarray) -> tuple[float, float]:
+    a = to_display_uint8(img_a)
+    b = to_display_uint8(img_b)
+
+    if a.ndim == 3:
+        a = cv2.cvtColor(a, cv2.COLOR_RGB2GRAY)
+    if b.ndim == 3:
+        b = cv2.cvtColor(b, cv2.COLOR_RGB2GRAY)
+    if a.shape != b.shape:
+        b = cv2.resize(b, (a.shape[1], a.shape[0]))
+
+    p = float(sk_psnr(a, b, data_range=255))
+    s = float(sk_ssim(a, b, data_range=255.0))
+    return p, round(s, 4)
+
+
+def compute_detection_metrics(embedded: np.ndarray, tampered: np.ndarray, pred_mask: np.ndarray) -> tuple[float, float, float]:
+    emb_u8 = to_display_uint8(embedded)
+    tam_u8 = to_display_uint8(tampered)
+    if emb_u8.ndim == 3:
+        emb_u8 = cv2.cvtColor(emb_u8, cv2.COLOR_RGB2GRAY)
+    if tam_u8.ndim == 3:
+        tam_u8 = cv2.cvtColor(tam_u8, cv2.COLOR_RGB2GRAY)
+
+    gt = (emb_u8 != tam_u8)
+    pred = (to_display_uint8(pred_mask) > 127)
+
+    tp = np.sum(gt & pred)
+    fp = np.sum((~gt) & pred)
+    fn = np.sum(gt & (~pred))
+
+    prec = float(tp / (tp + fp)) if (tp + fp) > 0 else (1.0 if np.sum(gt) == 0 else 0.0)
+    rec = float(tp / (tp + fn)) if (tp + fn) > 0 else (1.0 if np.sum(gt) == 0 else 0.0)
+    f1 = float(2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    return rec, prec, f1
+
+
+def get_all_sample_paths():
+    sample_dir = os.path.join(_BASE_DIR, "image", "original_image")
+    if os.path.isdir(sample_dir):
+        samples = [
+            os.path.join(sample_dir, f)
+            for f in os.listdir(sample_dir)
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
+        return samples
+    return []
+
+
+def load_system_default_image():
+    samples = get_all_sample_paths()
+    if samples:
+        chosen_path = random.choice(samples)
+        st.session_state.original = load_gray_image_from_array_or_path(chosen_path)
+    else:
+        st.session_state.original = make_demo_synthetic_image()
+
+
+def load_different_collage_default_image():
+    samples = get_all_sample_paths()
+    chosen_img = None
+    if len(samples) > 1 and st.session_state.original is not None:
+        remaining = []
+        for p in samples:
+            img = load_gray_image_from_array_or_path(p)
+            if not np.array_equal(img, st.session_state.original):
+                remaining.append(img)
+        if remaining:
+            chosen_img = random.choice(remaining)
+    elif len(samples) == 1:
+        img = load_gray_image_from_array_or_path(samples[0])
+        chosen_img = np.fliplr(img).copy()
+    
+    if chosen_img is None:
+        chosen_img = np.rot90(make_demo_synthetic_image())
+
+    st.session_state.collage_source_orig = chosen_img
+    model_auto, dev_auto = cached_model()
+    er_src = embed_watermark(chosen_img, model_auto, dev_auto, seed=st.session_state.seed, demo_block_id=0)
+    st.session_state.collage_source_embedded = er_src.embedded
+
+
+def init_session():
+    defaults = {
+        "original": None,
+        "embedded": None,
+        "tampered": None,
+        "embed_result": None,
+        "recover_result": None,
+        "seed": DEFAULT_SEED,
+        "attack_type": "custom_paint",
+        "attack_ratio": 50,
+        "detail_step": "撠敶勗?",
+        "show_upload_dialog_scope": None,
+        "collage_source_orig": None,
+        "collage_source_embedded": None,
+        "tab1_collage_uploader_key": 0,
+        "tab2_collage_uploader_key": 0,
+        "manual_tampered_cache": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def execute_tamper_and_recover():
+    """?典??湔蝡敶勗?銝衣??喳銵筑瘞游?芰?靽桀儔????""
+    if st.session_state.original is None:
+        st.error("隢?頛??嚗?)
+        return False
+
+    try:
+        model, device = cached_model()
+
+        if st.session_state.embedded is None:
+            er = embed_watermark(
+                st.session_state.original,
+                model,
+                device,
+                seed=st.session_state.seed,
+                demo_block_id=0,
+            )
+            st.session_state.embed_result = er
+            st.session_state.embedded = er.embedded
+
+        new_tampered = get_active_tampered()
+        if new_tampered is None:
+            new_tampered = to_display_uint8(st.session_state.embedded)
+
+        st.session_state.tampered = to_display_uint8(new_tampered)
+
