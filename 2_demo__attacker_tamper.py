@@ -1,6 +1,9 @@
 """
 2_attacker_tamper.py — 竄改端 (攻擊模擬)
-功能：攔截或載入含浮水印影像，執行多種模擬攻擊（中心挖空、局部塗鴉、複製貼上、隨機區塊、拼貼攻擊、自訂手繪），並匯出竄改影像。
+功能：
+1. 僅允許上傳檔案載入（支援一次上傳多個檔案）。
+2. 提供「全域批次統一攻擊」與「逐張獨立自訂攻擊」兩種操作模式。
+3. 即時對照原始含浮水印影像與受損影像，並支援一鍵打包下載所有竄改影像(ZIP)。
 執行：streamlit run 2_attacker_tamper.py
 """
 
@@ -10,6 +13,8 @@ import base64
 import os
 import random
 import sys
+import zipfile
+from io import BytesIO
 
 import cv2
 import numpy as np
@@ -21,11 +26,7 @@ if _BASE_DIR not in sys.path:
 
 from demo_pipeline_lu import (
     DEFAULT_SEED,
-    embed_watermark,
-    get_device,
     load_gray_image_from_array_or_path,
-    load_model,
-    make_demo_synthetic_image,
 )
 
 try:
@@ -50,13 +51,6 @@ except ImportError:
 
 st.set_page_config(page_title="竄改端 - 模擬攻擊", layout="wide")
 st.title("🦹 竄改端：中途攔截與惡意竄改模擬")
-
-
-@st.cache_resource
-def cached_model():
-    device = get_device()
-    model = load_model(device, _BASE_DIR)
-    return model, device
 
 
 def to_display_uint8(img: np.ndarray) -> np.ndarray:
@@ -85,72 +79,8 @@ def to_rgb(img: np.ndarray):
     return arr
 
 
-def open_opencv_drawing_window(img_gray: np.ndarray) -> np.ndarray:
-    vis_base = cv2.cvtColor(to_display_uint8(img_gray), cv2.COLOR_GRAY2BGR)
-    vis = vis_base.copy()
-    history = [vis.copy()]
-    redo_history = []
-    drawing = False
-    last_x, last_y = -1, -1
-    brush_thickness = 4
-
-    def draw_callback(event, x, y, flags, param):
-        nonlocal drawing, last_x, last_y, vis
-        if event == cv2.EVENT_LBUTTONDOWN:
-            drawing = True
-            last_x, last_y = x, y
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if drawing:
-                cv2.line(vis, (last_x, last_y), (x, y), (0, 0, 0), brush_thickness)
-                last_x, last_y = x, y
-        elif event == cv2.EVENT_LBUTTONUP:
-            if drawing:
-                drawing = False
-                history.append(vis.copy())
-                redo_history.clear()
-
-    window_name = "Manual Tamper (S: Save, Q: Quit, Up/Down: Brush, Left: Undo)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window_name, draw_callback)
-
-    while True:
-        display_frame = vis.copy()
-        cv2.putText(
-            display_frame,
-            f"Brush: {brush_thickness}",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 255),
-            2,
-        )
-        cv2.imshow(window_name, display_frame)
-        key = cv2.waitKeyEx(1)
-        if key in (ord('s'), ord('S')):
-            break
-        elif key in (ord('q'), ord('Q'), 27):
-            vis = vis_base.copy()
-            break
-        elif key in (ord('z'), ord('Z'), 8, 2424832, 81):  # Undo
-            if len(history) > 1:
-                redo_history.append(history.pop())
-                vis = history[-1].copy()
-        elif key in (2555904, 83):  # Redo
-            if len(redo_history) > 0:
-                restored = redo_history.pop()
-                history.append(restored.copy())
-                vis = restored.copy()
-        elif key in (2490368, 82):  # Up
-            brush_thickness = min(40, brush_thickness + 2)
-        elif key in (2621440, 84):  # Down
-            brush_thickness = max(2, brush_thickness - 2)
-
-    cv2.destroyAllWindows()
-    return cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
-
-
 # =========================================================================
-# 各類破壞攻擊之強健運算函數 (含防崩潰自動降階機制)
+# 攻擊運算核心
 # =========================================================================
 def execute_deletion(img_u8: np.ndarray, ratio: int) -> np.ndarray:
     if deletion_attack is not None:
@@ -159,7 +89,6 @@ def execute_deletion(img_u8: np.ndarray, ratio: int) -> np.ndarray:
             return res[0] if isinstance(res, (tuple, list)) else res
         except Exception:
             pass
-    # 備用純數值挖空 (填白)
     h, w = img_u8.shape[:2]
     out = img_u8.copy()
     scale = np.sqrt(max(0.05, min(0.95, ratio / 100.0)))
@@ -175,7 +104,6 @@ def execute_doodle(img_u8: np.ndarray, ratio: int) -> np.ndarray:
         res = doodle_attack_top_down(img_u8, ratio)
         return res[0] if isinstance(res, (tuple, list)) else res
     except Exception:
-        # 備用由上而下塗黑
         h, w = img_u8.shape[:2]
         out = img_u8.copy()
         cut = int(h * (ratio / 100.0))
@@ -190,7 +118,6 @@ def execute_copy_paste(img_u8: np.ndarray, ratio: int) -> np.ndarray:
             return res[0] if isinstance(res, (tuple, list)) else res
         except Exception:
             pass
-    # 備用內部區塊複製貼上
     h, w = img_u8.shape[:2]
     out = img_u8.copy()
     shift = max(2, int(w * (ratio / 200.0)))
@@ -213,7 +140,6 @@ def execute_random_blocks(img_u8: np.ndarray, ratio: int, seed: int) -> np.ndarr
             return res
         except Exception:
             pass
-    # 備用隨機 32x32 區塊塗黑
     out = img_u8.copy()
     rng = random.Random(seed)
     block_indices = list(range(16))
@@ -225,226 +151,261 @@ def execute_random_blocks(img_u8: np.ndarray, ratio: int, seed: int) -> np.ndarr
     return out
 
 
-def execute_collage(img_u8: np.ndarray, src_img: np.ndarray, ratio: int) -> np.ndarray:
-    src_u8 = to_display_uint8(src_img)
-    if src_u8.shape != img_u8.shape:
-        src_u8 = cv2.resize(src_u8, (img_u8.shape[1], img_u8.shape[0]))
+def execute_collage(img_u8: np.ndarray, src_img: np.ndarray | None, ratio: int) -> np.ndarray:
+    if src_img is None:
+        src_u8 = np.rot90(img_u8, 2)
+    else:
+        src_u8 = to_display_uint8(src_img)
+        if src_u8.shape != img_u8.shape:
+            src_u8 = cv2.resize(src_u8, (img_u8.shape[1], img_u8.shape[0]))
     if ca_attack is not None:
         try:
             res = ca_attack(img_u8, src_u8, int(ratio), side="right")
             return res[0] if isinstance(res, (tuple, list)) else res
         except Exception:
             pass
-    # 備用右側拼貼置換
     out = img_u8.copy()
     cut = int(img_u8.shape[1] * (ratio / 100.0))
     out[:, img_u8.shape[1] - cut :] = src_u8[:, img_u8.shape[1] - cut :]
     return out
 
 
-def execute_preset_manual(img_u8: np.ndarray) -> np.ndarray:
-    """提供備用預設塗鴉筆畫（避免在無桌面 GUI 環境無法手動塗鴉）。"""
-    out = img_u8.copy()
-    cv2.line(out, (10, 10), (118, 118), 0, 12)
-    cv2.line(out, (10, 118), (118, 10), 0, 12)
-    return out
+def execute_attack_dispatch(img_u8: np.ndarray, atk_type: str, ratio: int, collage_src: np.ndarray | None = None) -> np.ndarray:
+    if atk_type == "deletion":
+        return execute_deletion(img_u8, ratio)
+    elif atk_type == "doodle":
+        return execute_doodle(img_u8, ratio)
+    elif atk_type == "random_block":
+        return execute_random_blocks(img_u8, ratio, seed=DEFAULT_SEED)
+    elif atk_type == "copy_paste":
+        return execute_copy_paste(img_u8, ratio)
+    elif atk_type == "collage":
+        return execute_collage(img_u8, collage_src, ratio)
+    elif atk_type == "none":
+        return img_u8.copy()
+    return img_u8.copy()
+
+
+ATTACK_OPTIONS = {
+    "deletion": "中心區塊挖空（刪除填白）",
+    "doodle": "局部塗鴉遮蔽（由上而下塗黑）",
+    "random_block": "隨機區塊攻擊（隨機破壞 32×32 區塊）",
+    "copy_paste": "區塊複製貼上攻擊（原圖內部平移置換）",
+    "collage": "拼貼攻擊（使用反轉/外部圖置換）",
+    "none": "不破壞（純驗證完整性）",
+}
 
 
 def init_session():
-    if "input_watermarked" not in st.session_state:
-        synth = make_demo_synthetic_image()
-        model, dev = cached_model()
-        er = embed_watermark(synth, model, dev, seed=DEFAULT_SEED, demo_block_id=0)
-        st.session_state.input_watermarked = er.embedded
-    if "tampered_result" not in st.session_state:
-        st.session_state.tampered_result = None
-    if "manual_cache" not in st.session_state:
-        st.session_state.manual_cache = None
-    if "collage_source" not in st.session_state:
-        st.session_state.collage_source = np.rot90(make_demo_synthetic_image())
-    if "last_uploaded_key" not in st.session_state:
-        st.session_state.last_uploaded_key = None
-    if "attack_type_select" not in st.session_state:
-        st.session_state.attack_type_select = "deletion"
-    if "attack_ratio_val" not in st.session_state:
-        st.session_state.attack_ratio_val = 50
+    if "uploaded_images" not in st.session_state:
+        st.session_state.uploaded_images = []
+    if "image_names" not in st.session_state:
+        st.session_state.image_names = []
+    if "last_sig" not in st.session_state:
+        st.session_state.last_sig = ""
+    if "current_view_idx" not in st.session_state:
+        st.session_state.current_view_idx = 0
+    if "per_image_configs" not in st.session_state:
+        st.session_state.per_image_configs = {}
+    if "tampered_images" not in st.session_state:
+        st.session_state.tampered_images = []
+    if "collage_global_src" not in st.session_state:
+        st.session_state.collage_global_src = None
 
 
 init_session()
 
 # =========================================================================
-# 步驟 1：載入含浮水印影像
+# 步驟 1：載入含浮水印影像（僅允許上傳，支援多選）
 # =========================================================================
-st.markdown("### 1. 攔截 / 載入含浮水印影像")
-up_col, preview_col = st.columns([1.2, 1])
+st.markdown("### 1. 攔截 / 載入含浮水印影像 (僅限檔案上傳)")
+up_files = st.file_uploader(
+    "📥 請上傳來自傳送端的含浮水印影像 (支援一次選取多個 PNG / JPG 檔案)",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+    key="watermark_multi_uploader",
+)
 
-with up_col:
-    up_watermark = st.file_uploader(
-        "📥 上傳來自傳送端的含浮水印影像 (PNG / JPG)",
-        type=["png", "jpg", "jpeg"],
-        key="watermark_uploader",
-    )
-    if up_watermark is not None:
-        file_bytes = up_watermark.getvalue()
-        file_key = f"{up_watermark.name}_{len(file_bytes)}"
-        if st.session_state.last_uploaded_key != file_key:
-            st.session_state.last_uploaded_key = file_key
-            loaded_img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-            if loaded_img is not None:
-                st.session_state.input_watermarked = load_gray_image_from_array_or_path(loaded_img)
-                st.session_state.tampered_result = None
-                st.session_state.manual_cache = None
-                st.rerun()
+if up_files:
+    cur_sig = "_".join([f"{f.name}_{f.size}" for f in up_files])
+    if cur_sig != st.session_state.last_sig:
+        new_imgs = []
+        new_names = []
+        for f in up_files:
+            bytes_data = f.read()
+            dec = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if dec is not None:
+                new_imgs.append(load_gray_image_from_array_or_path(dec))
+                new_names.append(f.name)
+        if new_imgs:
+            st.session_state.uploaded_images = new_imgs
+            st.session_state.image_names = new_names
+            st.session_state.last_sig = cur_sig
+            st.session_state.current_view_idx = 0
+            st.session_state.per_image_configs = {
+                i: {"type": "deletion", "ratio": 50} for i in range(len(new_imgs))
+            }
+            st.session_state.tampered_images = []
+            st.rerun()
 
-    if st.button("🔄 使用預設含浮水印影像", use_container_width=True):
-        synth = make_demo_synthetic_image()
-        model, dev = cached_model()
-        er = embed_watermark(synth, model, dev, seed=DEFAULT_SEED, demo_block_id=0)
-        st.session_state.input_watermarked = er.embedded
-        st.session_state.tampered_result = None
-        st.session_state.manual_cache = None
-        st.session_state.last_uploaded_key = None
-        st.rerun()
+if not st.session_state.uploaded_images:
+    st.warning("⚠️ 目前尚未載入任何影像。請於上方上傳至少一張含浮水印之影像以繼續操作。")
+    st.stop()
 
-with preview_col:
-    if st.session_state.input_watermarked is not None:
-        img_disp = to_display_uint8(st.session_state.input_watermarked)
-        st.image(
-            to_rgb(cv2.resize(img_disp, (240, 240), interpolation=cv2.INTER_NEAREST)),
-            caption="已載入之含浮水印影像 (未竄改保護圖)",
-            width=240,
-        )
+total_imgs = len(st.session_state.uploaded_images)
+st.success(f"🟢 已成功讀取 {total_imgs} 張含浮水印影像")
 
 st.divider()
 
 # =========================================================================
-# 步驟 2：選擇與執行攻擊
+# 步驟 2：選擇與執行攻擊模式
 # =========================================================================
-st.markdown("### 2. 執行模擬攻擊")
-ctrl_col, view_col = st.columns([1.1, 1.4])
+st.markdown("### 2. 模擬攻擊參數設定")
+
+config_mode = st.radio(
+    "選擇攻擊配置模式：",
+    ["全域批次統一設定 (所有影像套用相同攻擊與竄改率)", "個別自訂設定 (每一張影像指定不同攻擊與竄改率)"],
+    horizontal=True,
+)
+
+ctrl_col, preview_col = st.columns([1.1, 1.4])
 
 with ctrl_col:
-    attack_type = st.selectbox(
-        "選擇破壞行為模式",
-        ["deletion", "doodle", "random_block", "copy_paste", "collage", "custom_paint", "none"],
-        index=["deletion", "doodle", "random_block", "copy_paste", "collage", "custom_paint", "none"].index(
-            st.session_state.attack_type_select
-        ) if st.session_state.attack_type_select in ["deletion", "doodle", "random_block", "copy_paste", "collage", "custom_paint", "none"] else 0,
-        format_func=lambda x: {
-            "deletion": "中心區塊挖空（刪除填白）",
-            "doodle": "局部塗鴉遮蔽（由上而下塗黑）",
-            "random_block": "隨機區塊攻擊（隨機破壞 32×32 區塊）",
-            "copy_paste": "區塊複製貼上攻擊（原圖內部平移置換）",
-            "collage": "拼貼攻擊（使用第 2 張影像大區塊置換）",
-            "custom_paint": "🎨 自訂手繪塗鴉（彈出獨立視窗繪製 / 預設筆刷）",
-            "none": "不破壞（純驗證完整性）",
-        }[x],
-        key="sel_attack_type",
-    )
-    st.session_state.attack_type_select = attack_type
-
-    ratio = 50
-    if attack_type not in ["custom_paint", "none"]:
-        ratio = st.slider(
-            "破壞面積比例設定 (%)",
-            10,
-            90,
-            st.session_state.attack_ratio_val,
-            5,
-            key="slider_ratio",
+    if config_mode.startswith("全域批次統一設定"):
+        st.markdown("##### ⚙️ 全域統一參數")
+        g_attack = st.selectbox(
+            "統一攻擊模式",
+            list(ATTACK_OPTIONS.keys()),
+            format_func=lambda x: ATTACK_OPTIONS[x],
+            key="g_atk_sel",
         )
-        st.session_state.attack_ratio_val = ratio
+        g_ratio = 50
+        if g_attack != "none":
+            g_ratio = st.slider("統一破壞面積比例 (%)", 10, 90, 50, 5, key="g_ratio_slider")
 
-    if attack_type == "custom_paint":
-        st.caption("手動塗鴉模式：點選下方按鈕開啟 OpenCV 繪圖視窗（按 S 鍵儲存），或直接套用預設筆刷。")
-        c_p1, c_p2 = st.columns(2)
-        with c_p1:
-            if st.button("🎨 開啟繪畫視窗", use_container_width=True):
-                if st.session_state.input_watermarked is not None:
-                    res_draw = open_opencv_drawing_window(st.session_state.input_watermarked)
-                    st.session_state.manual_cache = res_draw
-                    st.session_state.tampered_result = res_draw
-                    st.success("手繪塗鴉已套用！")
-                    st.rerun()
-        with c_p2:
-            if st.button("✏️ 套用預設塗鴉筆畫", use_container_width=True):
-                if st.session_state.input_watermarked is not None:
-                    res_def = execute_preset_manual(to_display_uint8(st.session_state.input_watermarked))
-                    st.session_state.manual_cache = res_def
-                    st.session_state.tampered_result = res_def
-                    st.success("預設交叉筆畫已套用！")
-                    st.rerun()
+        if g_attack == "collage":
+            up_src2 = st.file_uploader("選取外部拼貼參考圖 (若未上傳則自動翻轉置換)", type=["png", "jpg", "jpeg"], key="g_col_src")
+            if up_src2 is not None:
+                dec2 = cv2.imdecode(np.frombuffer(up_src2.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
+                st.session_state.collage_global_src = load_gray_image_from_array_or_path(dec2)
 
-    if attack_type == "collage":
-        up_src2 = st.file_uploader("選取第 2 張拼貼來源圖", type=["png", "jpg", "jpeg"], key="collage_2nd")
-        if up_src2 is not None:
-            raw_b2 = up_src2.getvalue()
-            dec2 = cv2.imdecode(np.frombuffer(raw_b2, np.uint8), cv2.IMREAD_GRAYSCALE)
-            if dec2 is not None:
-                st.session_state.collage_source = load_gray_image_from_array_or_path(dec2)
+        # 同步至每張圖的配置
+        for i in range(total_imgs):
+            st.session_state.per_image_configs[i] = {"type": g_attack, "ratio": g_ratio}
 
-    # 執行竄改計算核心
-    host_u8 = to_display_uint8(st.session_state.input_watermarked)
-    if attack_type == "custom_paint":
-        tampered_img = (
-            st.session_state.manual_cache
-            if st.session_state.manual_cache is not None
-            else execute_preset_manual(host_u8)
-        )
-    elif attack_type == "deletion":
-        tampered_img = execute_deletion(host_u8, ratio)
-    elif attack_type == "doodle":
-        tampered_img = execute_doodle(host_u8, ratio)
-    elif attack_type == "random_block":
-        tampered_img = execute_random_blocks(host_u8, ratio, seed=DEFAULT_SEED)
-    elif attack_type == "copy_paste":
-        tampered_img = execute_copy_paste(host_u8, ratio)
-    elif attack_type == "collage":
-        tampered_img = execute_collage(host_u8, st.session_state.collage_source, ratio)
-    elif attack_type == "none":
-        tampered_img = host_u8.copy()
     else:
-        tampered_img = host_u8.copy()
+        st.markdown("##### ⚙️ 個別影像參數設定")
+        target_img_idx = st.selectbox(
+            "選擇欲個別調整的影像",
+            options=list(range(total_imgs)),
+            format_func=lambda i: f"影像 {i+1} : {st.session_state.image_names[i]}",
+            key="per_img_selector",
+        )
+        st.session_state.current_view_idx = target_img_idx
+        cur_cfg = st.session_state.per_image_configs.get(target_img_idx, {"type": "deletion", "ratio": 50})
 
-    st.session_state.tampered_result = tampered_img
-
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("💥 執行竄改並確認輸出", type="primary", use_container_width=True):
-        st.success("✅ 影像竄改已成功套用！右側已更新受損影像，可進行下載。")
-
-with view_col:
-    st.markdown("##### 🖼️ 破壞對照顯示區")
-    comp_col1, comp_col2 = st.columns(2)
-    with comp_col1:
-        if st.session_state.input_watermarked is not None:
-            w_disp = to_display_uint8(st.session_state.input_watermarked)
-            st.image(
-                to_rgb(cv2.resize(w_disp, (240, 240), interpolation=cv2.INTER_NEAREST)),
-                caption="1. 攔截之含浮水印影像",
-                use_container_width=True,
+        p_attack = st.selectbox(
+            f"影像 {target_img_idx+1} 之攻擊模式",
+            list(ATTACK_OPTIONS.keys()),
+            index=list(ATTACK_OPTIONS.keys()).index(cur_cfg["type"]),
+            format_func=lambda x: ATTACK_OPTIONS[x],
+            key=f"p_atk_sel_{target_img_idx}",
+        )
+        p_ratio = 50
+        if p_attack != "none":
+            p_ratio = st.slider(
+                f"影像 {target_img_idx+1} 之破壞比例 (%)",
+                10,
+                90,
+                cur_cfg["ratio"],
+                5,
+                key=f"p_ratio_slider_{target_img_idx}",
             )
-    with comp_col2:
-        if st.session_state.tampered_result is not None:
-            t_disp = to_display_uint8(st.session_state.tampered_result)
-            st.image(
-                to_rgb(cv2.resize(t_disp, (240, 240), interpolation=cv2.INTER_NEAREST)),
-                caption="2. 套用破壞後之竄改影像",
-                use_container_width=True,
-            )
+
+        st.session_state.per_image_configs[target_img_idx] = {"type": p_attack, "ratio": p_ratio}
+
+    # 執行批次攻擊計算
+    computed_tampered = []
+    for i in range(total_imgs):
+        cfg = st.session_state.per_image_configs.get(i, {"type": "deletion", "ratio": 50})
+        host = to_display_uint8(st.session_state.uploaded_images[i])
+        res = execute_attack_dispatch(host, cfg["type"], cfg["ratio"], st.session_state.collage_global_src)
+        computed_tampered.append(res)
+    st.session_state.tampered_images = computed_tampered
+
+    st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+    st.info(f"💡 目前已為全部 **{total_imgs}** 張影像套用指定破壞設定。")
+
+with preview_col:
+    st.markdown("##### 🖼️ 影像切換與攻擊前後對照")
+    
+    # 縮圖選擇橫條
+    thumb_cols = st.columns(min(total_imgs, 6))
+    for i in range(min(total_imgs, 6)):
+        with thumb_cols[i]:
+            if st.button(f"圖 {i+1}", key=f"btn_view_{i}", use_container_width=True):
+                st.session_state.current_view_idx = i
+
+    v_idx = st.session_state.current_view_idx
+    if v_idx >= total_imgs:
+        v_idx = 0
+        st.session_state.current_view_idx = 0
+
+    st.caption(f"目前顯示：**第 {v_idx+1} / {total_imgs} 張**（{st.session_state.image_names[v_idx]}） | 套用模式：`{st.session_state.per_image_configs[v_idx]['type']}` | 比例：`{st.session_state.per_image_configs[v_idx]['ratio']}%`")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        w_disp = to_display_uint8(st.session_state.uploaded_images[v_idx])
+        st.image(
+            to_rgb(cv2.resize(w_disp, (240, 240), interpolation=cv2.INTER_NEAREST)),
+            caption=f"原含浮水印影像 ({v_idx+1})",
+            use_container_width=True,
+        )
+    with c2:
+        t_disp = to_display_uint8(st.session_state.tampered_images[v_idx])
+        st.image(
+            to_rgb(cv2.resize(t_disp, (240, 240), interpolation=cv2.INTER_NEAREST)),
+            caption=f"竄改破壞後影像 ({v_idx+1})",
+            use_container_width=True,
+        )
 
 st.divider()
 
 # =========================================================================
-# 步驟 3：匯出竄改影像
+# 步驟 3：匯出竄改影像（支援一次性下載所有竄改影像）
 # =========================================================================
 st.markdown("### 3. 匯出竄改影像 (傳送給接收端)")
-if st.session_state.tampered_result is not None:
-    _, tam_buf = cv2.imencode(".png", to_display_uint8(st.session_state.tampered_result))
+
+zip_buf = BytesIO()
+with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    for i, t_img in enumerate(st.session_state.tampered_images):
+        raw_name = st.session_state.image_names[i]
+        out_name = f"tampered_{os.path.splitext(raw_name)[0]}.png"
+        _, enc_png = cv2.imencode(".png", to_display_uint8(t_img))
+        zf.writestr(out_name, enc_png.tobytes())
+
+zip_buf.seek(0)
+
+down_col1, down_col2 = st.columns(2)
+
+with down_col1:
     st.download_button(
-        label="💾 下載竄改影像 (tampered_image.png)",
-        data=tam_buf.tobytes(),
-        file_name="tampered_image.png",
-        mime="image/png",
+        label=f"📦 一次性下載所有竄改影像 ({total_imgs} 張 ZIP 壓縮包)",
+        data=zip_buf.getvalue(),
+        file_name="tampered_all_images.zip",
+        mime="application/zip",
         type="primary",
+        use_container_width=True,
+    )
+
+with down_col2:
+    cur_t_img = st.session_state.tampered_images[v_idx]
+    _, cur_enc = cv2.imencode(".png", to_display_uint8(cur_t_img))
+    cur_name = f"tampered_{os.path.splitext(st.session_state.image_names[v_idx])[0]}.png"
+    st.download_button(
+        label=f"💾 僅下載當前預覽影像 ({cur_name})",
+        data=cur_enc.tobytes(),
+        file_name=cur_name,
+        mime="image/png",
         use_container_width=True,
     )
